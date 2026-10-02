@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream, type WriteStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, open, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -75,15 +75,29 @@ async function account(handle: AppHandle, username: string) {
   assert.equal(login.status, 200, JSON.stringify(login.body));
   assert.equal(login.body.password, undefined);
   assert.equal(JSON.stringify(login.body).includes(PASSWORD), false);
-  const cookie = (login.headers['set-cookie'] as string[] | undefined ?? [])
-    .map((value) => value.split(';')[0])
-    .join('; ');
+  const setCookie = login.headers['set-cookie'];
+  const cookieValues = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+  const cookie = cookieValues.map((value) => value.split(';')[0]).join('; ');
   return {
     agent,
     cookie,
     csrf: login.body.csrfToken as string,
     userId: login.body.user.id as string,
   };
+}
+
+function responseText(response: { body?: unknown; text?: string }): string {
+  if (Buffer.isBuffer(response.body)) return response.body.toString('utf8');
+  return response.text ?? '';
+}
+
+async function waitFor(check: () => Promise<boolean>): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 3000) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('Timed out waiting for the storage folder to change.');
 }
 
 async function uploadNamed(
@@ -196,7 +210,7 @@ describe('portal', () => {
       assert.equal(downloaded.headers['content-type'], 'application/octet-stream');
       assert.match(String(downloaded.headers['content-disposition']), /attachment/);
       assert.equal(downloaded.headers['x-content-type-options'], 'nosniff');
-      assert.equal(downloaded.text, 'beta-longer');
+      assert.equal(responseText(downloaded), 'beta-longer');
 
       const html = await uploadNamed(ada.agent, ada.csrf, 'page.html', '<html><script>alert(1)</script></html>');
       const htmlDownload = await ada.agent.get(`/api/files/${html.body.file.id}/download`);
@@ -284,39 +298,44 @@ describe('portal', () => {
   });
 
   it('limits how many uploads one person can run at once', async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-'));
-    let releaseGate: () => void = () => {};
-    const gate = new Promise<void>((resolve) => {
-      releaseGate = resolve;
-    });
-    const blocking: TempWriter = (filePath) => {
-      const stream = createWriteStream(filePath, { flags: 'wx' });
-      const write = stream.write.bind(stream) as WriteStream['write'];
-      stream.write = ((chunk: never, encoding?: never, callback?: never) => {
-        void gate.then(() => {
-          write.call(stream, chunk, encoding as never, callback as never);
-        });
-        return true;
-      }) as WriteStream['write'];
-      return stream;
-    };
-    const handle = await createApp(
-      testConfig(dir, { maxUploadsPerUser: 1, maxUploadsGlobal: 4 }),
-      { passwordCost: 4, openTemp: blocking },
-    );
-    try {
+    await withPortal({ maxUploadsPerUser: 1, maxUploadsGlobal: 4 }, async (handle) => {
       const ada = await account(handle, 'ada');
-      const first = uploadNamed(ada.agent, ada.csrf, 'slow.txt', 'hello');
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      const second = await uploadNamed(ada.agent, ada.csrf, 'next.txt', 'hello');
-      assert.equal(second.status, 429);
-      releaseGate();
-      assert.equal((await first).status, 201);
-    } finally {
-      releaseGate();
-      handle.close();
-      await removeDir(dir);
-    }
+      const server = http.createServer(handle.app);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      const boundary = '----holdopen';
+      const head = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="hold.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      );
+      const held = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/files',
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': String(head.length + (2 * 1024 * 1024)),
+          Cookie: ada.cookie,
+          'X-CSRF-Token': ada.csrf,
+        },
+      });
+      held.on('error', () => {});
+      held.write(head);
+      held.write(Buffer.alloc(64 * 1024, 4));
+      const tmpDir = path.join(handle.config.storageDir, 'tmp');
+      try {
+        await waitFor(async () => (await readdir(tmpDir)).length > 0);
+        const second = await uploadNamed(ada.agent, ada.csrf, 'next.txt', 'hello');
+        assert.equal(second.status, 429);
+      } finally {
+        held.destroy();
+      }
+      await waitFor(async () => (await readdir(tmpDir)).length === 0);
+      const third = await uploadNamed(ada.agent, ada.csrf, 'after.txt', 'hello');
+      assert.equal(third.status, 201);
+      await new Promise((resolve) => server.close(() => resolve(undefined)));
+    });
   });
 
   it('reports a full disk and does not publish the file', async () => {
@@ -374,7 +393,8 @@ describe('portal', () => {
       assert.equal(listed.body.files.length, 1);
       assert.equal(listed.body.files[0].id, fileId);
       const downloaded = await agent.get(`/api/files/${fileId}/download`);
-      assert.equal(downloaded.text, 'still-here');
+      assert.equal(downloaded.status, 200);
+      assert.equal(responseText(downloaded), 'still-here');
 
       const orphanId = randomUUID();
       await writeFile(objectPath(config.storageDir, orphanId)!, 'orphan');
@@ -448,32 +468,28 @@ describe('portal', () => {
       const head = Buffer.from(
         `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="partial.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
       );
-      await new Promise<void>((resolve) => {
-        const req = http.request({
-          hostname: '127.0.0.1',
-          port,
-          path: '/api/files',
-          method: 'POST',
-          headers: {
-            'Content-Type': `multipart/form-data; boundary=${boundary}`,
-            'Content-Length': String(head.length + 1024 * 1024),
-            Cookie: ada.cookie,
-            'X-CSRF-Token': ada.csrf,
-          },
-        });
-        req.write(head);
-        req.write(Buffer.alloc(32 * 1024, 7));
-        setTimeout(() => {
-          req.destroy();
-          resolve();
-        }, 100);
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/files',
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': String(head.length + 1024 * 1024),
+          Cookie: ada.cookie,
+          'X-CSRF-Token': ada.csrf,
+        },
       });
-      await new Promise((resolve) => server.close(() => resolve(undefined)));
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      const tmp = await readdir(path.join(handle.config.storageDir, 'tmp'));
-      assert.deepEqual(tmp, []);
+      req.on('error', () => {});
+      req.write(head);
+      req.write(Buffer.alloc(64 * 1024, 7));
+      const tmpDir = path.join(handle.config.storageDir, 'tmp');
+      await waitFor(async () => (await readdir(tmpDir)).length > 0);
+      req.destroy();
+      await waitFor(async () => (await readdir(tmpDir)).length === 0);
       const listed = await ada.agent.get('/api/files');
       assert.equal(listed.body.files.length, 0);
+      await new Promise((resolve) => server.close(() => resolve(undefined)));
     });
   });
 
