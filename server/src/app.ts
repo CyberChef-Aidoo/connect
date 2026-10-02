@@ -439,6 +439,14 @@ async function handleUpload(
 
     const file = getReadyFile(ctx.db, id, userId);
     res.status(201).json({ file });
+  } catch (error) {
+    await discardTemp(partial);
+    if (!res.headersSent) {
+      const mapped = mapFsError(error);
+      res.status(mapped.httpStatus).json({ error: mapped.message });
+      return;
+    }
+    throw error;
   } finally {
     release();
   }

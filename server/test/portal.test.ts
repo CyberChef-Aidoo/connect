@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, type WriteStream } from 'node:fs';
 import { mkdtemp, open, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -210,7 +211,7 @@ describe('portal', () => {
       const blake = await account(handle, 'blake');
       const boundary = '----portalform';
       const body = Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="..\\\\..\\\\outside.txt"\r\nContent-Type: application/octet-stream\r\n\nsafe\r\n--${boundary}--\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="..\\\\..\\\\outside.txt"\r\nContent-Type: application/octet-stream\r\n\r\nsafe\r\n--${boundary}--\r\n`,
         'utf8',
       );
       const uploaded = await ada.agent
@@ -256,17 +257,17 @@ describe('portal', () => {
   });
 
   it('enforces the file-size and storage limits', async () => {
-    await withPortal({ maxFileBytes: 8, maxStorageBytes: 15 }, async (handle) => {
+    await withPortal({ maxFileBytes: 12, maxStorageBytes: 15 }, async (handle) => {
       const ada = await account(handle, 'ada');
-      const tooBig = await uploadNamed(ada.agent, ada.csrf, 'big.txt', '0123456789');
+      const tooBig = await uploadNamed(ada.agent, ada.csrf, 'big.txt', '0123456789abc');
       assert.equal(tooBig.status, 413);
-      const first = await uploadNamed(ada.agent, ada.csrf, 'one.txt', '12345');
+      const first = await uploadNamed(ada.agent, ada.csrf, 'one.txt', '12345678');
       assert.equal(first.status, 201);
-      const second = await uploadNamed(ada.agent, ada.csrf, 'two.txt', '123456');
+      const second = await uploadNamed(ada.agent, ada.csrf, 'two.txt', '12345678');
       assert.equal(second.status, 507);
       const listed = await ada.agent.get('/api/files');
       assert.equal(listed.body.files.length, 1);
-      assert.equal(listed.body.storage.usedBytes, 5);
+      assert.equal(listed.body.storage.usedBytes, 8);
       assert.equal(listed.body.storage.limitBytes, 15);
     });
   });
@@ -283,38 +284,39 @@ describe('portal', () => {
   });
 
   it('limits how many uploads one person can run at once', async () => {
-    await withPortal({ maxUploadsPerUser: 1, maxUploadsGlobal: 4 }, async (handle) => {
-      const ada = await account(handle, 'ada');
-      let release: (() => void) | undefined;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const blocking: TempWriter = (filePath) => {
-        const stream = createWriteStream(filePath, { flags: 'wx' });
-        const write = stream.write.bind(stream);
-        stream.write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
-          void gate.then(() => {
-            write(chunk as never, encoding as never, callback as never);
-          });
-          return true;
-        }) as WriteStream['write'];
-        return stream;
-      };
-      const handleBlocked = await createApp(handle.config, { passwordCost: 4, openTemp: blocking });
-      try {
-        const user = await account(handleBlocked, 'ada');
-        const first = uploadNamed(user.agent, user.csrf, 'slow.txt', 'hello');
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        const second = await uploadNamed(user.agent, user.csrf, 'next.txt', 'hello');
-        assert.equal(second.status, 429);
-        release!();
-        assert.equal((await first).status, 201);
-      } finally {
-        release!();
-        handleBlocked.close();
-      }
-      void ada;
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-'));
+    let releaseGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
     });
+    const blocking: TempWriter = (filePath) => {
+      const stream = createWriteStream(filePath, { flags: 'wx' });
+      const write = stream.write.bind(stream) as WriteStream['write'];
+      stream.write = ((chunk: never, encoding?: never, callback?: never) => {
+        void gate.then(() => {
+          write.call(stream, chunk, encoding as never, callback as never);
+        });
+        return true;
+      }) as WriteStream['write'];
+      return stream;
+    };
+    const handle = await createApp(
+      testConfig(dir, { maxUploadsPerUser: 1, maxUploadsGlobal: 4 }),
+      { passwordCost: 4, openTemp: blocking },
+    );
+    try {
+      const ada = await account(handle, 'ada');
+      const first = uploadNamed(ada.agent, ada.csrf, 'slow.txt', 'hello');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const second = await uploadNamed(ada.agent, ada.csrf, 'next.txt', 'hello');
+      assert.equal(second.status, 429);
+      releaseGate();
+      assert.equal((await first).status, 201);
+    } finally {
+      releaseGate();
+      handle.close();
+      await removeDir(dir);
+    }
   });
 
   it('reports a full disk and does not publish the file', async () => {
@@ -394,6 +396,14 @@ describe('portal', () => {
         ownerId,
         originalName: 'never.txt',
         sizeBytes: 3,
+        createdAt: new Date().toISOString(),
+      }, config.maxStorageBytes);
+      const incompleteId = randomUUID();
+      stageFile(second.db, {
+        id: incompleteId,
+        ownerId,
+        originalName: 'partial.txt',
+        sizeBytes: 2,
         createdAt: new Date().toISOString(),
       }, config.maxStorageBytes);
       markReady(second.db, brokenId);
@@ -538,8 +548,9 @@ describe('portal', () => {
   it('creates a user from the command line without printing the password', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-'));
     const password = 'command-line-password';
+    const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/create-user.ts', 'casey'], {
-      cwd: path.resolve('src', '..'),
+      cwd: serverRoot,
       env: {
         ...process.env,
         HOST: '127.0.0.1',

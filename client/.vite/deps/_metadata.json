@@ -1,0 +1,31 @@
+{
+  "hash": "37cc57f3",
+  "configHash": "78f5749a",
+  "lockfileHash": "539b65cf",
+  "browserHash": "f222f317",
+  "optimized": {
+    "react": {
+      "src": "../../../node_modules/react/index.js",
+      "file": "react.js",
+      "fileHash": "4bba3292",
+      "needsInterop": true
+    },
+    "react-dom/client": {
+      "src": "../../../node_modules/react-dom/client.js",
+      "file": "react-dom_client.js",
+      "fileHash": "f57c9306",
+      "needsInterop": true
+    },
+    "react/jsx-dev-runtime": {
+      "src": "../../../node_modules/react/jsx-dev-runtime.js",
+      "file": "react_jsx-dev-runtime.js",
+      "fileHash": "daa365c4",
+      "needsInterop": true
+    }
+  },
+  "chunks": {
+    "chunk-IOCVFEP2": {
+      "file": "chunk-IOCVFEP2.js"
+    }
+  }
+}
