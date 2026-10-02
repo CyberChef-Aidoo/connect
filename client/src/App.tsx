@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import {
   ApiError,
   deleteFile,
@@ -71,7 +71,7 @@ function Login({ onSuccess }: { onSuccess: (session: Session) => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function submit(event: React.FormEvent) {
+  async function submit(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
     setError('');
@@ -217,8 +217,7 @@ function Dashboard({
     }
   }
 
-  function addFiles(fileList: FileList | File[]) {
-    const incoming = Array.from(fileList as ArrayLike<File>);
+  function addFiles(incoming: File[]) {
     if (incoming.length === 0) return;
     const next: UploadItem[] = incoming.map((file) => {
       const tooBig = file.size > session.limits.maxFileBytes;
