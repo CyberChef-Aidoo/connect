@@ -147,7 +147,16 @@ export function receiveUpload(options: {
 
 export async function discardTemp(filePath: string | null): Promise<void> {
   if (!filePath) return;
-  await rm(filePath, { force: true });
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(filePath, { force: true });
+      return;
+    } catch (error) {
+      const code = errorCode(error);
+      if ((code !== 'EBUSY' && code !== 'EPERM') || attempt === 4) return;
+      await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+    }
+  }
 }
 
 function defaultTempWriter(filePath: string): WriteStream {
