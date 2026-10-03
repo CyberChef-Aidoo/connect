@@ -292,7 +292,7 @@ export function purgeOwnedBinFile(db: DatabaseSync, id: string, ownerId: string)
   return existing ? 'forbidden' : 'missing';
 }
 
-export function takeExpiredBinIds(db: DatabaseSync, nowMs = Date.now()): string[] {
+export function takeExpiredBinIds(db: DatabaseSync, nowMs = Date.now()): Array<{ id: string; versionIds: string[] }> {
   const cutoff = new Date(nowMs - BIN_RETENTION_MS).toISOString();
   return withImmediateTransaction(db, () => {
     const rows = db.prepare(

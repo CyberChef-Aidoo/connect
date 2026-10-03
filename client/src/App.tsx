@@ -1701,8 +1701,8 @@ function FileHistory({
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [busy, setBusy] = useState(false);
 
-  async function chooseReplacement(list: FileList | null) {
-    const next = list?.[0];
+  async function chooseReplacement(chosen: globalThis.FileList | null) {
+    const next = chosen?.item(0);
     if (!next) return;
     setBusy(true);
     onError('');
