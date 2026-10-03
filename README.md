@@ -213,6 +213,7 @@ You can also start it by hand with `.\scripts\start-portal.ps1`.
 | `MAX_FILE_BYTES` | Per-file limit. Default `2147483648` (2 GB). |
 | `MAX_STORAGE_BYTES` | Total finished and in-progress files. Default `53687091200` (50 GB). |
 | `SESSION_SECRET` | Long random string. Required before other computers connect. |
+| `OPEN_ACCESS` | `1` opens the file list with no username or password. Leave it empty to require sign-in. |
 | `SESSION_TTL_HOURS` | How long a sign-in lasts. Default 12. |
 | `HTTPS_PFX_PATH` / `HTTPS_PFX_PASSPHRASE` | Certificate for LAN use. |
 | `HTTPS_KEY_PATH` / `HTTPS_CERT_PATH` | Use these instead of a PFX if you already have a PEM key and certificate. |
