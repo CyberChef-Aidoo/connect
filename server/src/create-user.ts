@@ -15,8 +15,10 @@ try {
     console.error(nameError);
     process.exitCode = 1;
   } else {
-    const fromEnv = process.env.PORTAL_NEW_PASSWORD;
-    const password = fromEnv ?? await prompted.question('Password (visible as you type): ');
+    const fromEnv = process.env.PORTAL_NEW_PASSWORD?.trim();
+    const password = fromEnv
+      ? fromEnv
+      : await prompted.question('Password, at least 8 characters (visible as you type): ');
     const problem = passwordProblem(password);
     if (problem) {
       console.error(problem);

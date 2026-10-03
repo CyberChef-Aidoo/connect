@@ -112,6 +112,21 @@ async function uploadNamed(
     .attach('file', Buffer.from(content), { filename });
 }
 
+function appendChunk(
+  agent: request.Agent,
+  csrf: string,
+  id: string,
+  offset: number,
+  body: Buffer,
+) {
+  return agent
+    .patch(`/api/uploads/${id}`)
+    .set('X-CSRF-Token', csrf)
+    .set('Content-Type', 'application/octet-stream')
+    .set('Upload-Offset', String(offset))
+    .send(body);
+}
+
 describe('configuration', () => {
   it('refuses a network address without HTTPS', () => {
     const config = resolveConfig({
@@ -176,6 +191,9 @@ describe('portal', () => {
   it('uploads, lists, searches, sorts, and downloads', async () => {
     await withPortal({}, async (handle) => {
       const ada = await account(handle, 'ada');
+      const me = await ada.agent.get('/api/auth/me');
+      assert.equal(me.body.uploads.maxPerUser, 3);
+      assert.equal(me.body.uploads.maxGlobal, 8);
       const first = await uploadNamed(ada.agent, ada.csrf, 'notes.txt', 'alpha');
       assert.equal(first.status, 201);
       const second = await uploadNamed(ada.agent, ada.csrf, 'notes.txt', 'beta-longer');
@@ -325,6 +343,8 @@ describe('portal', () => {
       held.write(Buffer.alloc(64 * 1024, 4));
       const tmpDir = path.join(handle.config.storageDir, 'tmp');
       try {
+        const caps = await ada.agent.get('/api/auth/me');
+        assert.equal(caps.body.uploads.maxPerUser, 1);
         await waitFor(async () => (await readdir(tmpDir)).length > 0);
         const second = await uploadNamed(ada.agent, ada.csrf, 'next.txt', 'hello');
         assert.equal(second.status, 429);
@@ -558,6 +578,296 @@ describe('portal', () => {
       });
       assert.equal(actual.digest('hex'), expected);
       await new Promise((resolve) => server.close(() => resolve(undefined)));
+    });
+  });
+
+  it('resumes an upload from the last saved part', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const created = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: '..\\notes.txt', sizeBytes: 6 });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      assert.equal(created.body.session.originalName, 'notes.txt');
+      assert.equal(created.body.session.receivedBytes, 0);
+      assert.equal(created.body.chunkBytes, 8 * 1024 * 1024);
+      const id = created.body.session.id as string;
+
+      const first = await appendChunk(ada.agent, ada.csrf, id, 0, Buffer.from('abc'));
+      assert.equal(first.status, 200, JSON.stringify(first.body));
+      assert.equal(first.body.session.receivedBytes, 3);
+
+      const listed = await ada.agent.get('/api/uploads');
+      assert.equal(listed.status, 200);
+      assert.equal(listed.body.sessions.length, 1);
+      assert.equal(listed.body.sessions[0].receivedBytes, 3);
+
+      const files = await ada.agent.get('/api/files');
+      assert.equal(files.body.files.length, 0);
+      assert.equal(files.body.storage.usedBytes, 6);
+
+      const second = await appendChunk(ada.agent, ada.csrf, id, 3, Buffer.from('def'));
+      assert.equal(second.status, 201, JSON.stringify(second.body));
+      assert.equal(second.body.file.originalName, 'notes.txt');
+      const downloaded = await ada.agent.get(`/api/files/${id}/download`);
+      assert.equal(downloaded.status, 200);
+      assert.ok(Buffer.isBuffer(downloaded.body));
+      assert.equal(Buffer.compare(downloaded.body, Buffer.from('abcdef')), 0);
+      const after = await ada.agent.get('/api/uploads');
+      assert.equal(after.body.sessions.length, 0);
+    });
+  });
+
+  it('rejects a mismatched offset, another person, and an anonymous request', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const blake = await account(handle, 'blake');
+      const anonymous = request(handle.app);
+      assert.equal((await anonymous.post('/api/uploads').send({ originalName: 'a.txt', sizeBytes: 1 })).status, 401);
+      assert.equal((await anonymous.get('/api/uploads')).status, 401);
+
+      const missingToken = await ada.agent.post('/api/uploads').send({ originalName: 'a.txt', sizeBytes: 1 });
+      assert.equal(missingToken.status, 403);
+
+      const empty = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'empty.dat', sizeBytes: 0 });
+      assert.equal(empty.status, 201, JSON.stringify(empty.body));
+      assert.equal(empty.body.file.originalName, 'empty.dat');
+      assert.equal(empty.body.file.sizeBytes, 0);
+
+      const created = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'part.bin', sizeBytes: 4 });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      const id = created.body.session.id as string;
+      const saved = await appendChunk(ada.agent, ada.csrf, id, 0, Buffer.from('ab'));
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+
+      const wrong = await appendChunk(ada.agent, ada.csrf, id, 0, Buffer.from('zz'));
+      assert.equal(wrong.status, 409);
+      assert.equal(wrong.body.receivedBytes, 2);
+
+      const hidden = await appendChunk(blake.agent, blake.csrf, id, 2, Buffer.from('cd'));
+      assert.equal(hidden.status, 404);
+      const removed = await blake.agent.delete(`/api/uploads/${id}`).set('X-CSRF-Token', blake.csrf);
+      assert.equal(removed.status, 404);
+
+      const rest = await appendChunk(ada.agent, ada.csrf, id, 2, Buffer.from('cd'));
+      assert.equal(rest.status, 201, JSON.stringify(rest.body));
+    });
+  });
+
+  it('counts an open upload toward the storage limit', async () => {
+    await withPortal({ maxFileBytes: 12, maxStorageBytes: 15 }, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const created = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'reserved.bin', sizeBytes: 10 });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      const listed = await ada.agent.get('/api/files');
+      assert.equal(listed.body.storage.usedBytes, 10);
+      const blocked = await uploadNamed(ada.agent, ada.csrf, 'extra.txt', '12345678');
+      assert.equal(blocked.status, 507);
+      const second = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'more.bin', sizeBytes: 8 });
+      assert.equal(second.status, 507);
+    });
+  });
+
+  it('keeps an unfinished upload across a restart and drops it after it expires', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const created = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'keep.bin', sizeBytes: 4 });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      const id = created.body.session.id as string;
+      const saved = await appendChunk(ada.agent, ada.csrf, id, 0, Buffer.from('ab'));
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      const partial = tempPath(handle.config.storageDir, id);
+      assert.ok(partial);
+      const extra = await open(partial, 'a');
+      await extra.write(Buffer.from('zzzz'));
+      await extra.close();
+
+      const trimmed = await reconcileStorage(handle.db, handle.config.storageDir);
+      assert.equal(trimmed.removedTemp, 0);
+      assert.equal((await stat(partial)).size, 2);
+      const still = await ada.agent.get('/api/uploads');
+      assert.equal(still.body.sessions[0].receivedBytes, 2);
+
+      const shorter = await open(partial, 'r+');
+      await shorter.truncate(1);
+      await shorter.close();
+      await reconcileStorage(handle.db, handle.config.storageDir);
+      const lowered = await ada.agent.get('/api/uploads');
+      assert.equal(lowered.body.sessions[0].receivedBytes, 1);
+      assert.equal((await stat(partial)).size, 1);
+
+      await writeFile(partial, Buffer.from('wxyz'));
+      handle.db.prepare('UPDATE upload_sessions SET received_bytes = 4 WHERE id = ?').run(id);
+      const published = await reconcileStorage(handle.db, handle.config.storageDir);
+      assert.equal(published.publishedInterrupted, 1);
+      const downloaded = await ada.agent.get(`/api/files/${id}/download`);
+      assert.equal(responseText(downloaded), 'wxyz');
+
+      const again = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'old.bin', sizeBytes: 2 });
+      assert.equal(again.status, 201, JSON.stringify(again.body));
+      const expiredId = again.body.session.id as string;
+      handle.db.prepare(`UPDATE upload_sessions SET expires_at = ? WHERE id = ?`).run('2000-01-01T00:00:00.000Z', expiredId);
+      const expired = await reconcileStorage(handle.db, handle.config.storageDir);
+      assert.equal(expired.removedTemp, 1);
+      const gone = await ada.agent.get('/api/uploads');
+      assert.equal(gone.body.sessions.length, 0);
+      const expiredTemp = tempPath(handle.config.storageDir, expiredId);
+      assert.equal(expiredTemp ? await stat(expiredTemp).then(() => true, () => false) : false, false);
+    });
+  });
+
+  it('does not keep a chunk that stopped before it was fully received', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const created = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'cut.bin', sizeBytes: 200_000 });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      const id = created.body.session.id as string;
+      const partial = tempPath(handle.config.storageDir, id);
+      assert.ok(partial);
+
+      const server = http.createServer(handle.app);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      try {
+        const address = server.address();
+        const port = typeof address === 'object' && address ? address.port : 0;
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: `/api/uploads/${id}`,
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(100_000),
+            'Upload-Offset': '0',
+            Cookie: ada.cookie,
+            'X-CSRF-Token': ada.csrf,
+          },
+        });
+        req.on('error', () => {});
+        req.write(Buffer.alloc(64 * 1024, 7));
+        await waitFor(async () => ((await stat(partial).catch(() => null))?.size ?? 0) > 0);
+        req.destroy();
+        await waitFor(async () => ((await stat(partial).catch(() => null))?.size ?? -1) === 0);
+        const listed = await ada.agent.get('/api/uploads');
+        assert.equal(listed.body.sessions[0].receivedBytes, 0);
+        const files = await ada.agent.get('/api/files');
+        assert.equal(files.body.files.length, 0);
+      } finally {
+        await new Promise((resolve) => server.close(() => resolve(undefined)));
+      }
+    });
+  });
+
+  it('puts files in shared folders and pages the list', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const blake = await account(handle, 'blake');
+      assert.equal((await request(handle.app).post('/api/folders').send({ name: 'hidden' })).status, 401);
+
+      const created = await ada.agent
+        .post('/api/folders')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ name: '..\\..\\outside', parentId: null });
+      assert.equal(created.status, 201, JSON.stringify(created.body));
+      assert.equal(created.body.folder.name, 'outside');
+      const folderId = created.body.folder.id as string;
+
+      const duplicate = await ada.agent
+        .post('/api/folders')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ name: 'OUTSIDE' });
+      assert.equal(duplicate.status, 409);
+
+      const forbidden = await blake.agent
+        .patch(`/api/folders/${folderId}`)
+        .set('X-CSRF-Token', blake.csrf)
+        .send({ name: 'nope' });
+      assert.equal(forbidden.status, 403);
+      const renamed = await ada.agent
+        .patch(`/api/folders/${folderId}`)
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ name: 'Reports' });
+      assert.equal(renamed.status, 200, JSON.stringify(renamed.body));
+
+      const child = await ada.agent
+        .post('/api/folders')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ name: '2026', parentId: folderId });
+      assert.equal(child.status, 201, JSON.stringify(child.body));
+      const rootFolders = await ada.agent.get('/api/files');
+      assert.equal(rootFolders.body.folders.some((folder: { name: string }) => folder.name === '2026'), false);
+      const nested = await ada.agent.get('/api/files').query({ folderId });
+      assert.equal(nested.body.folders[0].name, '2026');
+      assert.equal(nested.body.breadcrumbs.at(-1).name, 'Reports');
+      const removedChild = await ada.agent.delete(`/api/folders/${child.body.folder.id}`).set('X-CSRF-Token', ada.csrf);
+      assert.equal(removedChild.status, 200);
+
+      const started = await ada.agent
+        .post('/api/uploads')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ originalName: 'notes.txt', sizeBytes: 4, folderId });
+      assert.equal(started.status, 201, JSON.stringify(started.body));
+      const fileId = started.body.session.id as string;
+      const finished = await appendChunk(ada.agent, ada.csrf, fileId, 0, Buffer.from('note'));
+      assert.equal(finished.status, 201, JSON.stringify(finished.body));
+
+      const root = await ada.agent.get('/api/files');
+      assert.equal(root.body.files.some((file: { originalName: string }) => file.originalName === 'notes.txt'), false);
+      const inside = await blake.agent.get('/api/files').query({ folderId });
+      assert.equal(inside.body.files.length, 1);
+      assert.equal(inside.body.files[0].folderName, 'Reports');
+      const found = await ada.agent.get('/api/files').query({ q: 'notes' });
+      assert.equal(found.body.files.length, 1);
+
+      const stored = objectPath(handle.config.storageDir, fileId);
+      assert.ok(stored);
+      assert.equal(path.basename(path.dirname(stored)), 'objects');
+      assert.deepEqual((await readdir(handle.config.storageDir)).sort(), ['objects', 'tmp']);
+
+      const blocked = await ada.agent.delete(`/api/folders/${folderId}`).set('X-CSRF-Token', ada.csrf);
+      assert.equal(blocked.status, 409);
+      assert.equal((await ada.agent.delete(`/api/files/${fileId}`).set('X-CSRF-Token', ada.csrf)).status, 200);
+      assert.equal((await ada.agent.delete(`/api/folders/${folderId}`).set('X-CSRF-Token', ada.csrf)).status, 200);
+
+      for (const name of ['one.txt', 'two.txt', 'three.txt']) {
+        assert.equal((await uploadNamed(ada.agent, ada.csrf, name, name)).status, 201);
+      }
+      const first = await ada.agent.get('/api/files').query({ limit: 2, sort: 'name', order: 'asc' });
+      assert.equal(first.body.files.length, 2);
+      assert.equal(typeof first.body.page.nextCursor, 'string');
+      const second = await ada.agent.get('/api/files').query({
+        limit: 2,
+        sort: 'name',
+        order: 'asc',
+        cursor: first.body.page.nextCursor,
+      });
+      assert.equal(second.body.files.length, 1);
+      assert.equal(second.body.page.nextCursor, null);
+      const names = [...first.body.files, ...second.body.files].map((file: { originalName: string }) => file.originalName);
+      assert.deepEqual(names, ['one.txt', 'three.txt', 'two.txt']);
+      assert.equal((await ada.agent.get('/api/files').query({ cursor: 'not-a-page' })).status, 400);
     });
   });
 

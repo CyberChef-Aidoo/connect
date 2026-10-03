@@ -1,7 +1,13 @@
-import { readdir, rm } from 'node:fs/promises';
+import { readdir, rename, rm, truncate } from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { listReadyIds, listStaging, markReady, removeFileRecord } from './files.js';
+import {
+  deleteSession,
+  listRecoverySessions,
+  setReceivedBytes,
+  takeForPublish,
+} from './resume.js';
 import { fileSize, objectPath, tempPath } from './storage.js';
 
 export type RecoveryReport = {
@@ -20,8 +26,10 @@ export type RecoveryReport = {
  * - If the finished object is already on disk with the expected size, publishing is completed.
  * - Otherwise the reservation and any partial or final bytes are removed.
  * - Ready rows whose files are missing or the wrong size are removed.
- * - Object files with no row are removed. Temp files are always removed at startup
- *   because an in-progress upload cannot continue after the process exits.
+ * - An unfinished upload session is kept until it expires. Its temp file is truncated
+ *   back to the last saved checkpoint, or the checkpoint is lowered if the file is shorter.
+ * - A session whose saved bytes already match the full size is published.
+ * - Expired sessions and temp files with no session are removed.
  */
 export async function reconcileStorage(db: DatabaseSync, storageDir: string): Promise<RecoveryReport> {
   const report: RecoveryReport = {
@@ -34,6 +42,8 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
   };
 
   const known = new Set<string>();
+  const keptTemps = new Set<string>();
+  await repairUploadSessions(db, storageDir, known, keptTemps, report);
 
   for (const staging of listStaging(db)) {
     known.add(staging.id);
@@ -76,12 +86,63 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
 
   const tmpDir = path.join(storageDir, 'tmp');
   for (const name of await safeList(tmpDir)) {
-    if (name === '.write-probe') continue;
+    if (name === '.write-probe' || keptTemps.has(name)) continue;
     await rm(path.join(tmpDir, name), { force: true });
     report.removedTemp += 1;
   }
 
   return report;
+}
+
+async function repairUploadSessions(
+  db: DatabaseSync,
+  storageDir: string,
+  known: Set<string>,
+  keptTemps: Set<string>,
+  report: RecoveryReport,
+): Promise<void> {
+  for (const session of listRecoverySessions(db)) {
+    const partial = tempPath(storageDir, session.id);
+    const expired = Date.parse(session.expiresAt) <= Date.now();
+    if (expired) {
+      deleteSession(db, session.id);
+      if (partial) await rm(partial, { force: true });
+      report.removedTemp += 1;
+      continue;
+    }
+    const onDisk = partial ? await fileSize(partial) : null;
+    if (!partial || onDisk === null) {
+      deleteSession(db, session.id);
+      report.removedIncomplete += 1;
+      continue;
+    }
+    let size = onDisk;
+    let received = session.receivedBytes;
+    if (size > received) {
+      await truncate(partial, received);
+      size = received;
+    } else if (size < received) {
+      setReceivedBytes(db, session.id, size);
+      received = size;
+    }
+    if (received === session.sizeBytes && size === session.sizeBytes) {
+      const published = takeForPublish(db, session.id, session.ownerId, 0, { enforceQuota: false });
+      const finalPath = objectPath(storageDir, session.id);
+      if (published.ok && finalPath) {
+        try {
+          await rename(partial, finalPath);
+          if (markReady(db, session.id)) {
+            known.add(session.id);
+            report.publishedInterrupted += 1;
+            continue;
+          }
+        } catch {
+          // The staging row remains. The loop below removes it if the object is missing.
+        }
+      }
+    }
+    keptTemps.add(`${session.id}.partial`);
+  }
 }
 
 async function safeList(directory: string): Promise<string[]> {

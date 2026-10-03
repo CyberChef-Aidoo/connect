@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 
 export const PASSWORD_COST = 12;
-const MIN_LENGTH = 10;
+const MIN_LENGTH = 8;
 const MAX_BYTES = 72;
 
 export async function hashPassword(password: string, cost = PASSWORD_COST): Promise<string> {

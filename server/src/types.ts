@@ -25,4 +25,6 @@ export type FileRecord = {
   ownerId: string;
   ownerUsername: string;
   canDelete: boolean;
+  folderId: string | null;
+  folderName: string | null;
 };

@@ -10,8 +10,26 @@
   --danger: #9f2d2d;
   --ok: #1d6b3c;
   --shadow: 0 16px 40px rgba(55, 40, 18, 0.08);
+  --field: #ffffff;
+  --track: #efe7db;
   font-family: "Segoe UI", system-ui, sans-serif;
   line-height: 1.45;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161411;
+  --ink: #f4efe6;
+  --muted: #c3b8a8;
+  --line: #3a342c;
+  --panel: #221e19;
+  --accent: #2f9e99;
+  --accent-dark: #4eb8b3;
+  --danger: #ffb4b4;
+  --ok: #9ddead;
+  --shadow: none;
+  --field: #2a251f;
+  --track: #3a342c;
 }
 
 * { box-sizing: border-box; }
@@ -52,7 +70,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   border: 1px solid var(--line);
 }
 
-.ghost:hover { background: #f6f1e8; }
+.ghost:hover { background: var(--track); }
 .danger { background: var(--danger); color: white; }
 .ghost.danger { color: var(--danger); background: transparent; }
 
@@ -61,6 +79,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   display: grid;
   place-items: center;
   padding: 1.5rem;
+  position: relative;
 }
 
 .card, .panel, .storage {
@@ -84,7 +103,8 @@ label { font-weight: 650; }
 input, select {
   width: 100%;
   border: 1px solid var(--line);
-  background: white;
+  background: var(--field);
+  color: var(--ink);
   border-radius: 10px;
   padding: 0.65rem 0.75rem;
 }
@@ -110,10 +130,16 @@ progress { accent-color: var(--accent); }
   gap: 1rem;
   align-items: center;
 }
-.drop.hot { background: #e7f4f3; border-color: var(--accent); }
+.drop.hot { background: color-mix(in srgb, var(--accent) 16%, var(--panel)); border-color: var(--accent); }
 .drop h2 { margin: 0 0 0.2rem; font-size: 1.05rem; }
 .drop p { margin: 0; }
 .drop input { display: none; }
+
+.resume h2 { margin: 0 0 0.35rem; font-size: 1.05rem; }
+.resume p { margin: 0 0 0.8rem; }
+.resume ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.7rem; }
+.resume input { display: none; }
+.resume .banner { margin-bottom: 0.8rem; }
 
 .queue { margin-top: 1rem; }
 .queue h3 { margin: 0; font-size: 0.95rem; }
@@ -124,14 +150,33 @@ progress { accent-color: var(--accent); }
 .pill.done { color: var(--ok); }
 .pill.error, .fail { color: var(--danger); }
 .fail { margin: 0.25rem 0 0; }
-.bar { height: 0.4rem; background: #efe7db; border-radius: 99px; overflow: hidden; margin-top: 0.35rem; }
+.bar { height: 0.4rem; background: var(--track); border-radius: 99px; overflow: hidden; margin-top: 0.35rem; }
+.concurrency { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); min-width: 5.5rem; }
+.concurrency select { width: auto; }
+.theme-toggle { position: absolute; top: 1rem; right: 1rem; }
+.banner.ok { background: color-mix(in srgb, var(--ok) 18%, var(--panel)); color: var(--ok); }
+.banner.error { background: color-mix(in srgb, var(--danger) 16%, var(--panel)); color: var(--danger); }
 .bar span { display: block; height: 100%; background: var(--accent); }
+
+.folder-bar { display: grid; gap: 0.8rem; margin-bottom: 0.9rem; }
+.crumbs ol { display: flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; padding: 0; margin: 0; }
+.crumbs button { padding: 0.35rem 0.7rem; }
+.crumbs button[aria-current="page"] { border-color: var(--accent); }
+.folder-create { display: flex; gap: 0.6rem; align-items: end; }
+.folder-create label { display: grid; gap: 0.3rem; flex: 1; }
+.view-toggle { display: flex; gap: 0.4rem; align-items: end; }
+.view-toggle button[aria-pressed="true"] { border-color: var(--accent); }
+.folders { list-style: none; padding: 0; margin: 0 0 0.8rem; display: grid; gap: 0.45rem; }
+.folders li, .inline-rename { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.folder-open { font-weight: 700; }
+.inline-rename input { width: 12rem; }
+.grid { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: 0.75rem; }
+.tile { border: 1px solid var(--line); border-radius: 14px; padding: 0.85rem; display: grid; gap: 0.35rem; align-content: start; }
+.pager { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.8rem; }
 
 .toolbar { align-items: end; margin-bottom: 0.8rem; flex-wrap: wrap; }
 .toolbar label { display: grid; gap: 0.3rem; flex: 1; min-width: 12rem; }
 .banner { margin: 0; padding: 0.7rem 0.85rem; border-radius: 12px; }
-.banner.ok { background: #e7f6ec; color: var(--ok); }
-.banner.error { background: #fdecec; color: var(--danger); }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 caption { text-align: left; margin-bottom: 0.6rem; }

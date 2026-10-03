@@ -9,7 +9,7 @@ People sign in with their own username and password. Anyone who is signed in can
 
 Each file can be up to **2 GB**. The portal holds up to **50 GB** in total. Both limits are set in `.env`.
 
-Folder uploads, previews, resumable uploads, and sharing links are not part of this version.
+Folder uploads, previews, and sharing links are not part of this version. Files can be organized in shared folders. An upload can continue after it stops, for 24 hours, when the same file is chosen again.
 
 ## How it is put together
 
@@ -22,15 +22,18 @@ browser on another PC
         v
 Express on this Windows PC
    |-- session cookie + CSRF header
-   |-- SQLite database (users, sessions, file records)
-   `-- storage folder (one generated id per finished file)
+   |-- SQLite database (users, sessions, file records, unfinished uploads)
+   `-- storage folder (one generated id per file, including a saved partial)
 ```
 
-A file appears in the list only after the upload finishes and the size is checked. The bytes are written to a temporary file first, then the database reserves the space, then the file is moved into place and marked ready.
+A file appears in the list only after the upload finishes and the size is checked. The browser sends the file in parts of up to 8 MB. Each part is written to a temporary file and saved only after that part is complete. The full size is reserved as soon as the upload starts, so an unfinished upload counts toward the 50 GB limit. When the last part arrives, the file is moved into place and marked ready.
+
+Saved progress is kept for 24 hours. It is not a backup. After a reload, the browser cannot remember which file was selected, so the same file has to be chosen again. The portal checks the name and size only. Two different files with the same name and size cannot be told apart. Cancel removes the saved progress.
 
 If the process stops in the middle:
 
-- A temporary upload is deleted the next time the server starts. It is not listed.
+- A part that was cut off is discarded. The last complete part remains, and the upload can continue until it expires.
+- An unfinished upload older than 24 hours is deleted the next time the server starts. It is not listed.
 - A file that was fully written but not yet marked ready is published on the next start, when its size matches the database.
 - A database row whose file is missing, or whose size does not match, is removed.
 - A file on disk with no database row is removed.
@@ -80,7 +83,7 @@ Remove-Item Env:PORTAL_NEW_PASSWORD
 npm start
 ```
 
-Passwords must be 10 to 72 characters. The password is not printed back. Usernames are 3 to 32 characters: letters, numbers, periods, underscores, and hyphens.
+Passwords must be 8 to 72 characters. The password is not printed back. Usernames are 3 to 32 characters: letters, numbers, periods, underscores, and hyphens.
 
 Open `http://127.0.0.1:3000` on this same computer and sign in. This address does not work from another computer. That is intentional.
 
@@ -235,11 +238,11 @@ npm run create-user -- username
 ## Using the website
 
 1. Sign in.
-2. Drop files onto the page or choose them. Several files can upload at once, each with its own progress. Cancel stops that file.
-3. Search by filename. Sort by name, size, or date.
-4. Download uses the browser’s normal download. The file is not loaded into a script first.
+2. Drop files onto the page or choose them. The transfer list shows waiting, active, finished, canceled, and failed files. An active file shows how much has been sent, the recent speed, and an estimate of the time left. If the transfer stops making progress, the row says it is stalled. Cancel removes that upload, including any part already saved. Retry continues from the last saved part when the upload is still on the server. You can run 1, 2, or 3 uploads at once; the server still enforces its own cap. Leaving or reloading the page stops the browser’s current transfer. Choose the same file again to continue. Saved progress stays for 24 hours. The page cannot resume a file by itself after a reload.
+3. Create a folder and open it from the breadcrumb trail. A new upload goes into the folder you have open. Anyone signed in can open every folder. Only the person who created a folder can rename it, and can delete it when it is empty. Search still looks through every folder. Sort by name, size, or date. Switch between the list and the grid. The file list is loaded one page at a time.
+4. Download uses the browser’s own download. The page does not show download progress, because the browser does not give the page that control.
 5. Delete is offered only for files you uploaded. The server checks that again; hiding the button is not the only check.
-6. The bar at the top shows how much of the 50 GB is in use.
+6. The bar at the top shows how much of the 50 GB is in use, including space reserved by unfinished uploads.
 
 An empty list, a loading line, a success note, and the server’s error text are shown on the page. A file that is too large, a full portal, a full disk, or a lost connection is reported as a failed upload and is not added to the list.
 
@@ -251,9 +254,16 @@ All `/api` routes require a signed-in session except `POST /api/auth/login`.
 | --- | --- | --- |
 | `POST` | `/api/auth/login` | Body `{ "username", "password" }`. Sets an HttpOnly session cookie. |
 | `POST` | `/api/auth/logout` | Ends the session. Requires the `X-CSRF-Token` header. |
-| `GET` | `/api/auth/me` | Current person, CSRF token, and size limits. |
-| `GET` | `/api/files?q=&sort=name\|size\|date&order=asc\|desc` | Shared files plus storage used. |
-| `POST` | `/api/files` | Multipart upload, field name `file`. Requires `X-CSRF-Token`. |
+| `GET` | `/api/auth/me` | Current person, CSRF token, size limits, and upload caps. |
+| `GET` | `/api/files?q=&sort=name\|size\|date&order=asc\|desc&folderId=&cursor=&limit=` | Files in one folder, plus its subfolders, breadcrumbs, and the next page. A search looks through every folder. `limit` is 1 to 100 and defaults to 50. |
+| `POST` | `/api/folders` | Creates a shared folder. Body `{ "name", "parentId" }`. Requires `X-CSRF-Token`. |
+| `PATCH` | `/api/folders/:id` | Renames a folder the signed-in person created. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/folders/:id` | Deletes an empty folder the signed-in person created. Requires `X-CSRF-Token`. |
+| `POST` | `/api/uploads` | Starts an upload. Body `{ "originalName", "sizeBytes", "folderId" }`. `folderId` may be omitted for the top level. An empty file is published immediately. Requires `X-CSRF-Token`. |
+| `GET` | `/api/uploads` | Unfinished uploads for the signed-in person, and the part size. |
+| `PATCH` | `/api/uploads/:id` | Appends one part. Raw `application/octet-stream`, with `Upload-Offset` and `Content-Length`. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/uploads/:id` | Cancels an unfinished upload owned by the signed-in person. Requires `X-CSRF-Token`. |
+| `POST` | `/api/files` | One-shot multipart upload, field name `file`. Requires `X-CSRF-Token`. |
 | `GET` | `/api/files/:id/download` | Streams the file as a download. |
 | `DELETE` | `/api/files/:id` | Deletes a file the signed-in person uploaded. Requires `X-CSRF-Token`. |
 
@@ -264,8 +274,12 @@ The cookie is `HttpOnly` and `SameSite=Strict`. On HTTPS it is also `Secure`. St
 ```sql
 users (id, username, password_hash, created_at)
 sessions (sid, sess, expired)
-files (id, owner_id, original_name, size_bytes, created_at, state)
+files (id, owner_id, original_name, size_bytes, created_at, state, folder_id)
+upload_sessions (id, owner_id, original_name, size_bytes, received_bytes, created_at, updated_at, expires_at, folder_id)
+folders (id, parent_id, name, created_by, created_at)
 ```
+
+`files.folder_id` is empty at the top level. Folder names are display names. They are never used as a directory on disk.
 
 `state` is `staging` while a finished upload is being published, then `ready`. The list and downloads only use `ready`. Passwords are stored as bcrypt hashes. Session cookies and passwords are not written to the log.
 
@@ -275,7 +289,9 @@ files (id, owner_id, original_name, size_bytes, created_at, state)
 npm test
 ```
 
-The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, and creating a user from the command line.
+The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, creating a user from the command line, resumable uploads, shared folders, and paged lists. Folder checks cover a name that looks like a path, a duplicate name, another person’s rename, an empty delete, a folder that still has a file, uploading into a folder, and a second page.
+
+The transfer list, the folder buttons, and the list and grid switch were not clicked in a browser, and they were not tried from a second computer.
 
 They do not fill a real disk, and they do not open a second physical computer. Trying the site from another computer on your LAN is a manual check: trust `portal.cer` there, open `https://<this-pc-lan-ip>:8443`, sign in, upload a file, and download it back.
 

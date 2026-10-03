@@ -12,7 +12,7 @@
     "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w client && npm run build -w server",
     "start": "npm run start -w server",
-    "test": "npm run test -w server",
+    "test": "npm run test -w server && npm run test -w client",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
     "create-user": "node server/dist/create-user.js"
   },
