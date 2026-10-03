@@ -871,6 +871,74 @@ describe('portal', () => {
     });
   });
 
+  it('moves and deletes only your files, packs a zip, and keeps folder paths inside the open folder', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const blake = await account(handle, 'blake');
+      assert.equal((await request(handle.app).post('/api/files/move').send({ ids: ['x'] })).status, 401);
+      assert.equal((await request(handle.app).get('/api/files/zip')).status, 401);
+
+      const ensured = await ada.agent
+        .post('/api/folders/ensure')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ path: '..\\outside\\nested', parentId: null });
+      assert.equal(ensured.status, 201, JSON.stringify(ensured.body));
+      const folderId = ensured.body.folderId as string;
+      const again = await ada.agent
+        .post('/api/folders/ensure')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ path: 'outside/nested', parentId: null });
+      assert.equal(again.status, 201, JSON.stringify(again.body));
+      assert.equal(again.body.folderId, folderId);
+      assert.deepEqual(again.body.created, []);
+      assert.deepEqual((await readdir(handle.config.storageDir)).sort(), ['objects', 'tmp']);
+
+      const mine = await uploadNamed(ada.agent, ada.csrf, 'mine.txt', 'hello');
+      const theirs = await uploadNamed(blake.agent, blake.csrf, 'theirs.txt', 'secret');
+      assert.equal(mine.status, 201, JSON.stringify(mine.body));
+      assert.equal(theirs.status, 201, JSON.stringify(theirs.body));
+      const mineId = mine.body.file.id as string;
+      const theirsId = theirs.body.file.id as string;
+
+      const missingToken = await ada.agent.post('/api/files/move').send({ ids: [mineId], folderId });
+      assert.equal(missingToken.status, 403);
+
+      const packed = await ada.agent.get('/api/files/zip').query({ ids: `${mineId},${theirsId}` });
+      assert.equal(packed.status, 200);
+      assert.match(String(packed.headers['content-type']), /application\/zip/);
+      assert.match(String(packed.headers['content-disposition']), /portal-files\.zip/);
+      const zip = Buffer.isBuffer(packed.body) ? packed.body : Buffer.from(packed.text ?? '');
+      assert.equal(zip.subarray(0, 2).toString('utf8'), 'PK');
+      assert.equal(zip.includes(Buffer.from('hello')), true);
+      assert.equal(zip.includes(Buffer.from('secret')), true);
+      assert.equal(zip.includes(Buffer.from('mine.txt')), true);
+
+      const moved = await ada.agent
+        .post('/api/files/move')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ ids: [mineId, theirsId], folderId });
+      assert.equal(moved.status, 200, JSON.stringify(moved.body));
+      assert.deepEqual(moved.body.moved, [mineId]);
+      assert.equal(moved.body.skipped[0].id, theirsId);
+      assert.equal(moved.body.skipped[0].reason, 'forbidden');
+      const inside = await ada.agent.get('/api/files').query({ folderId });
+      assert.equal(inside.body.files.some((file: { id: string }) => file.id === mineId), true);
+      const root = await ada.agent.get('/api/files');
+      assert.equal(root.body.files.some((file: { id: string }) => file.id === mineId), false);
+      assert.equal(root.body.files.some((file: { id: string }) => file.id === theirsId), true);
+
+      const removed = await ada.agent
+        .post('/api/files/delete-many')
+        .set('X-CSRF-Token', ada.csrf)
+        .send({ ids: [mineId, theirsId] });
+      assert.equal(removed.status, 200, JSON.stringify(removed.body));
+      assert.deepEqual(removed.body.deleted, [mineId]);
+      assert.equal(removed.body.skipped[0].reason, 'forbidden');
+      const still = await blake.agent.get(`/api/files/${theirsId}/download`);
+      assert.equal(responseText(still), 'secret');
+    });
+  });
+
   it('creates a user from the command line without printing the password', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-'));
     const password = 'command-line-password';

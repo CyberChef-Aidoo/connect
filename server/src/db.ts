@@ -48,6 +48,7 @@ export function openDatabase(databasePath: string): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_upload_sessions_owner ON upload_sessions (owner_id, expires_at);
   `);
   migrateFolders(db);
+  migrateCatalog(db);
   return db;
 }
 
@@ -73,6 +74,51 @@ function migrateFolders(db: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_child_name ON folders(parent_id, name) WHERE parent_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id, name);
     CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id, state, created_at);
+  `);
+}
+
+function migrateCatalog(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tags (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS file_tags (
+      file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (file_id, tag_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, file_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS collections (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS collection_files (
+      collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+      file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      added_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (collection_id, file_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id);
+    CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_collection_files_file ON collection_files(file_id);
   `);
 }
 

@@ -100,6 +100,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .eyebrow { margin: 0; color: var(--accent); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
 .lede, .drop p, .status, caption { color: var(--muted); }
 label { font-weight: 650; }
+input[type="checkbox"] { width: auto; }
 input, select {
   width: 100%;
   border: 1px solid var(--line);
@@ -134,6 +135,9 @@ progress { accent-color: var(--accent); }
 .drop h2 { margin: 0 0 0.2rem; font-size: 1.05rem; }
 .drop p { margin: 0; }
 .drop input { display: none; }
+.drop-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.bulk { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.8rem; }
+.pick { display: flex; align-items: center; gap: 0.35rem; font-weight: 650; }
 
 .resume h2 { margin: 0 0 0.35rem; font-size: 1.05rem; }
 .resume p { margin: 0 0 0.8rem; }

@@ -27,4 +27,6 @@ export type FileRecord = {
   canDelete: boolean;
   folderId: string | null;
   folderName: string | null;
+  favorite: boolean;
+  tags: Array<{ id: string; name: string }>;
 };

@@ -20,6 +20,55 @@ export function sanitizeFolderName(raw: string): string | null {
   return sanitizeOriginalName(raw);
 }
 
+export function splitFolderPath(raw: string): string[] | null {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 1024) return null;
+  const parts = raw.split(/[/\\]/).map((part) => part.trim()).filter((part) => part && part !== '.' && part !== '..');
+  if (parts.length === 0 || parts.length > MAX_FOLDER_DEPTH) return null;
+  const names: string[] = [];
+  for (const part of parts) {
+    const name = sanitizeFolderName(part);
+    if (!name) return null;
+    names.push(name);
+  }
+  return names;
+}
+
+export function ensureFolderPath(
+  db: DatabaseSync,
+  parentId: string | null,
+  segments: string[],
+  userId: string,
+): { ok: true; folderId: string | null; created: string[] } | { ok: false; reason: 'missing' | 'duplicate' | 'deep' | 'bad-name' } {
+  if (parentId && !resolveFolder(db, parentId).ok) return { ok: false, reason: 'missing' };
+  let current = parentId;
+  const created: string[] = [];
+  for (const segment of segments) {
+    const existing = findChild(db, current, segment);
+    if (existing) {
+      current = existing;
+      continue;
+    }
+    const made = createFolder(db, { parentId: current, name: segment, createdBy: userId });
+    if (!made.ok && made.reason === 'duplicate') {
+      const again = findChild(db, current, segment);
+      if (!again) return { ok: false, reason: 'duplicate' };
+      current = again;
+      continue;
+    }
+    if (!made.ok) return made;
+    created.push(made.folder.name);
+    current = made.folder.id;
+  }
+  return { ok: true, folderId: current, created };
+}
+
+function findChild(db: DatabaseSync, parentId: string | null, name: string): string | undefined {
+  const row = (parentId
+    ? db.prepare('SELECT id FROM folders WHERE parent_id = ? AND name = ?').get(parentId, name)
+    : db.prepare('SELECT id FROM folders WHERE parent_id IS NULL AND name = ?').get(name)) as { id: string } | undefined;
+  return row?.id;
+}
+
 export function resolveFolder(
   db: DatabaseSync,
   folderId: string | null,

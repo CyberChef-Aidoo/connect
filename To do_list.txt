@@ -1,0 +1,3 @@
+Make this peer to peer where which of the host devices act as a server and a client at the same time. 
+
+I have to improve upon the user experience. 

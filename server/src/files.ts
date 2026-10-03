@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { sqlNumber, withImmediateTransaction } from './db.js';
+import { attachCatalog } from './catalog.js';
 import type { FileRecord } from './types.js';
 
 export type NewFile = {
@@ -104,6 +105,9 @@ export function listFiles(
     folderId: string | null;
     limit: number;
     cursor: string | null;
+    favoriteOnly?: boolean;
+    tagId?: string | null;
+    collectionId?: string | null;
   },
 ): FilePage | 'bad-sort' | 'bad-cursor' {
   const sort = options.sort as SortName;
@@ -113,16 +117,26 @@ export function listFiles(
   const cursorSql = CURSOR_SQL[key];
   if (!orderSql || !cursorSql) return 'bad-sort';
 
-  const params: Array<string | number> = [];
+  const params: Array<string | number> = [options.userId];
+  const wide = Boolean(options.query || options.favoriteOnly || options.tagId || options.collectionId);
   let where = "WHERE f.state = 'ready'";
   if (options.query) {
     where += " AND f.original_name LIKE ? ESCAPE '\\'";
     params.push(likePattern(options.query));
-  } else if (options.folderId) {
+  } else if (!wide && options.folderId) {
     where += ' AND f.folder_id = ?';
     params.push(options.folderId);
-  } else {
+  } else if (!wide) {
     where += ' AND f.folder_id IS NULL';
+  }
+  if (options.favoriteOnly) where += ' AND fav.user_id IS NOT NULL';
+  if (options.tagId) {
+    where += ' AND EXISTS (SELECT 1 FROM file_tags ft WHERE ft.file_id = f.id AND ft.tag_id = ?)';
+    params.push(options.tagId);
+  }
+  if (options.collectionId) {
+    where += ' AND EXISTS (SELECT 1 FROM collection_files cf WHERE cf.file_id = f.id AND cf.collection_id = ?)';
+    params.push(options.collectionId);
   }
   if (options.cursor) {
     const cursor = decodeCursor(options.cursor);
@@ -138,12 +152,14 @@ export function listFiles(
     FROM files f
     JOIN users u ON u.id = f.owner_id
     LEFT JOIN folders d ON d.id = f.folder_id
+    LEFT JOIN favorites fav ON fav.file_id = f.id AND fav.user_id = ?
     ${where}
     ORDER BY ${orderSql}
     LIMIT ?
   `).all(...params, options.limit + 1) as FileRow[];
 
   const page = rows.slice(0, options.limit).map((row) => mapFile(row, options.userId));
+  attachCatalog(db, page, options.userId);
   const last = page.at(-1);
   const nextCursor = rows.length > options.limit && last
     ? encodeCursor(sort === 'name' ? last.originalName : sort === 'size' ? String(last.sizeBytes) : last.createdAt, last.id)
@@ -159,7 +175,61 @@ export function getReadyFile(db: DatabaseSync, id: string, userId: string): File
     LEFT JOIN folders d ON d.id = f.folder_id
     WHERE f.id = ? AND f.state = 'ready'
   `).get(id) as FileRow | undefined;
-  return row ? mapFile(row, userId) : undefined;
+  if (!row) return undefined;
+  const file = mapFile(row, userId);
+  attachCatalog(db, [file], userId);
+  return file;
+}
+
+export type SkippedFile = { id: string; reason: 'missing' | 'forbidden' };
+
+export function moveOwnedFiles(
+  db: DatabaseSync,
+  ownerId: string,
+  ids: string[],
+  folderId: string | null,
+): { moved: string[]; skipped: SkippedFile[] } {
+  return withImmediateTransaction(db, () => applyOwnedChange(db, ownerId, ids, (id) => {
+    const result = db.prepare(
+      "UPDATE files SET folder_id = ? WHERE id = ? AND owner_id = ? AND state = 'ready'",
+    ).run(folderId, id, ownerId);
+    return result.changes === 1;
+  }));
+}
+
+export function deleteOwnedFiles(
+  db: DatabaseSync,
+  ownerId: string,
+  ids: string[],
+): { deleted: string[]; skipped: SkippedFile[] } {
+  const applied = withImmediateTransaction(db, () => applyOwnedChange(db, ownerId, ids, (id) => {
+    const result = db.prepare(
+      "DELETE FROM files WHERE id = ? AND owner_id = ? AND state = 'ready'",
+    ).run(id, ownerId);
+    return result.changes === 1;
+  }));
+  return { deleted: applied.moved, skipped: applied.skipped };
+}
+
+function applyOwnedChange(
+  db: DatabaseSync,
+  ownerId: string,
+  ids: string[],
+  change: (id: string) => boolean,
+): { moved: string[]; skipped: SkippedFile[] } {
+  const moved: string[] = [];
+  const skipped: SkippedFile[] = [];
+  for (const id of ids) {
+    if (change(id)) {
+      moved.push(id);
+      continue;
+    }
+    const existing = db.prepare(
+      "SELECT owner_id FROM files WHERE id = ? AND state = 'ready'",
+    ).get(id) as { owner_id: string } | undefined;
+    skipped.push({ id, reason: existing && existing.owner_id !== ownerId ? 'forbidden' : 'missing' });
+  }
+  return { moved, skipped };
 }
 
 export function deleteOwnedFile(db: DatabaseSync, id: string, ownerId: string): 'deleted' | 'missing' | 'forbidden' {
@@ -222,6 +292,8 @@ function mapFile(row: FileRow, userId: string): FileRecord {
     canDelete: row.owner_id === userId,
     folderId: row.folder_id,
     folderName: row.folder_name,
+    favorite: false,
+    tags: [],
   };
 }
 

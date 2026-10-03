@@ -27,6 +27,23 @@ export type PortalFile = {
   canDelete: boolean;
   folderId?: string | null;
   folderName?: string | null;
+  favorite?: boolean;
+  tags?: TagItem[];
+};
+
+export type TagItem = { id: string; name: string };
+
+export type CollectionItem = {
+  id: string;
+  name: string;
+  canRename: boolean;
+  canDelete: boolean;
+};
+
+export type FileFilters = {
+  favorite?: boolean;
+  tagId?: string;
+  collectionId?: string;
 };
 
 export type FolderItem = {
@@ -105,10 +122,14 @@ export async function listFiles(
   folderId: string | null = null,
   cursor: string | null = null,
   limit = 24,
+  filters: FileFilters = {},
 ): Promise<FileList> {
   const params = new URLSearchParams({ q: query, sort, order, limit: String(limit) });
   if (folderId) params.set('folderId', folderId);
   if (cursor) params.set('cursor', cursor);
+  if (filters.favorite) params.set('favorite', '1');
+  if (filters.tagId) params.set('tagId', filters.tagId);
+  if (filters.collectionId) params.set('collectionId', filters.collectionId);
   const response = await fetch(`/api/files?${params}`, { credentials: 'same-origin' });
   return readJson<FileList>(response);
 }
@@ -143,6 +164,51 @@ export async function deleteFolder(id: string, csrfToken: string): Promise<void>
   await readJson(response);
 }
 
+export async function ensureFolder(
+  path: string,
+  parentId: string | null,
+  csrfToken: string,
+): Promise<{ folderId: string | null }> {
+  const response = await fetch('/api/folders/ensure', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ path, parentId }),
+  });
+  return readJson(response);
+}
+
+export async function moveFiles(
+  ids: string[],
+  folderId: string | null,
+  csrfToken: string,
+): Promise<{ moved: string[]; skipped: Array<{ id: string; reason: string }> }> {
+  const response = await fetch('/api/files/move', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ ids, folderId }),
+  });
+  return readJson(response);
+}
+
+export async function deleteFiles(
+  ids: string[],
+  csrfToken: string,
+): Promise<{ deleted: string[]; skipped: Array<{ id: string; reason: string }> }> {
+  const response = await fetch('/api/files/delete-many', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ ids, }),
+  });
+  return readJson(response);
+}
+
+export function zipUrl(ids: string[]): string {
+  return `/api/files/zip?ids=${ids.map((id) => encodeURIComponent(id)).join(',')}`;
+}
+
 export async function deleteFile(id: string, csrfToken: string): Promise<void> {
   const response = await fetch(`/api/files/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -153,6 +219,93 @@ export async function deleteFile(id: string, csrfToken: string): Promise<void> {
 }
 
 const DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
+
+export async function listTags(): Promise<{ tags: TagItem[] }> {
+  const response = await fetch('/api/tags', { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function listCollections(): Promise<{ collections: CollectionItem[] }> {
+  const response = await fetch('/api/collections', { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function setFavorite(id: string, on: boolean, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/files/${encodeURIComponent(id)}/favorite`, {
+    method: on ? 'POST' : 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function tagFiles(ids: string[], name: string, csrfToken: string): Promise<void> {
+  const response = await fetch('/api/files/tags', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ ids, name }),
+  });
+  await readJson(response);
+}
+
+export async function detachTag(fileId: string, tagId: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/files/${encodeURIComponent(fileId)}/tags/${encodeURIComponent(tagId)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function createCollection(name: string, csrfToken: string): Promise<CollectionItem> {
+  const response = await fetch('/api/collections', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ name }),
+  });
+  const body = await readJson<{ collection: CollectionItem }>(response);
+  return body.collection;
+}
+
+export async function renameCollection(id: string, name: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/collections/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ name }),
+  });
+  await readJson(response);
+}
+
+export async function deleteCollection(id: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/collections/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function addToCollection(id: string, ids: string[], csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/collections/${encodeURIComponent(id)}/files`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ ids }),
+  });
+  await readJson(response);
+}
+
+export async function removeFromCollection(id: string, fileId: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/collections/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
 
 export async function listUploads(): Promise<{ sessions: UploadSession[]; chunkBytes: number }> {
   const response = await fetch('/api/uploads', { credentials: 'same-origin' });

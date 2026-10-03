@@ -9,7 +9,7 @@ People sign in with their own username and password. Anyone who is signed in can
 
 Each file can be up to **2 GB**. The portal holds up to **50 GB** in total. Both limits are set in `.env`.
 
-Folder uploads, previews, and sharing links are not part of this version. Files can be organized in shared folders. An upload can continue after it stops, for 24 hours, when the same file is chosen again.
+Previews and sharing links are not part of this version. Files can be organized in shared folders. A folder can be chosen when the browser allows it; otherwise choose the files. An upload can continue after it stops, for 24 hours, when the same file is chosen again.
 
 ## How it is put together
 
@@ -238,9 +238,9 @@ npm run create-user -- username
 ## Using the website
 
 1. Sign in.
-2. Drop files onto the page or choose them. The transfer list shows waiting, active, finished, canceled, and failed files. An active file shows how much has been sent, the recent speed, and an estimate of the time left. If the transfer stops making progress, the row says it is stalled. Cancel removes that upload, including any part already saved. Retry continues from the last saved part when the upload is still on the server. You can run 1, 2, or 3 uploads at once; the server still enforces its own cap. Leaving or reloading the page stops the browser’s current transfer. Choose the same file again to continue. Saved progress stays for 24 hours. The page cannot resume a file by itself after a reload.
+2. Drop files onto the page, choose files, or choose a folder when the browser offers that. A folder from your computer is recreated under the folder you have open. If the browser cannot pick a folder, choose the files instead. A path that tries to climb out with `..` stays inside the open folder. The transfer list shows waiting, active, finished, canceled, and failed files. An active file shows how much has been sent, the recent speed, and an estimate of the time left. If the transfer stops making progress, the row says it is stalled. Cancel removes that upload, including any part already saved. Retry continues from the last saved part when the upload is still on the server. You can run 1, 2, or 3 uploads at once; the server still enforces its own cap. Leaving or reloading the page stops the browser’s current transfer. Choose the same file again to continue. Saved progress stays for 24 hours. The page cannot resume a file by itself after a reload.
 3. Create a folder and open it from the breadcrumb trail. A new upload goes into the folder you have open. Anyone signed in can open every folder. Only the person who created a folder can rename it, and can delete it when it is empty. Search still looks through every folder. Sort by name, size, or date. Switch between the list and the grid. The file list is loaded one page at a time.
-4. Download uses the browser’s own download. The page does not show download progress, because the browser does not give the page that control.
+4. Select files to move them into the open folder, delete them, or download them as one zip. Move and delete apply only to files you uploaded. A zip can include any selected file, because anyone signed in can already download it. Up to 100 files at a time. A single download still uses the browser’s own download, and the page does not show download progress.
 5. Delete is offered only for files you uploaded. The server checks that again; hiding the button is not the only check.
 6. The bar at the top shows how much of the 50 GB is in use, including space reserved by unfinished uploads.
 
@@ -257,6 +257,10 @@ All `/api` routes require a signed-in session except `POST /api/auth/login`.
 | `GET` | `/api/auth/me` | Current person, CSRF token, size limits, and upload caps. |
 | `GET` | `/api/files?q=&sort=name\|size\|date&order=asc\|desc&folderId=&cursor=&limit=` | Files in one folder, plus its subfolders, breadcrumbs, and the next page. A search looks through every folder. `limit` is 1 to 100 and defaults to 50. |
 | `POST` | `/api/folders` | Creates a shared folder. Body `{ "name", "parentId" }`. Requires `X-CSRF-Token`. |
+| `POST` | `/api/folders/ensure` | Creates any missing folders in a relative path. Body `{ "path", "parentId" }`. Requires `X-CSRF-Token`. |
+| `POST` | `/api/files/move` | Moves files you uploaded. Body `{ "ids", "folderId" }`. `folderId` may be null for the top level. Requires `X-CSRF-Token`. |
+| `POST` | `/api/files/delete-many` | Deletes files you uploaded. Body `{ "ids" }`. Files you did not upload are left in place. Requires `X-CSRF-Token`. |
+| `GET` | `/api/files/zip?ids=` | Streams the chosen files as one zip. At most 100 ids. |
 | `PATCH` | `/api/folders/:id` | Renames a folder the signed-in person created. Requires `X-CSRF-Token`. |
 | `DELETE` | `/api/folders/:id` | Deletes an empty folder the signed-in person created. Requires `X-CSRF-Token`. |
 | `POST` | `/api/uploads` | Starts an upload. Body `{ "originalName", "sizeBytes", "folderId" }`. `folderId` may be omitted for the top level. An empty file is published immediately. Requires `X-CSRF-Token`. |
@@ -289,9 +293,9 @@ folders (id, parent_id, name, created_by, created_at)
 npm test
 ```
 
-The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, creating a user from the command line, resumable uploads, shared folders, and paged lists. Folder checks cover a name that looks like a path, a duplicate name, another person’s rename, an empty delete, a folder that still has a file, uploading into a folder, and a second page.
+The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, creating a user from the command line, resumable uploads, shared folders, and paged lists. Folder checks cover a name that looks like a path, a duplicate name, another person’s rename, an empty delete, a folder that still has a file, uploading into a folder, and a second page. Bulk checks cover moving and deleting only your own files, a zip of a shared file, and a folder path that tries to climb out.
 
-The transfer list, the folder buttons, and the list and grid switch were not clicked in a browser, and they were not tried from a second computer.
+The transfer list, folder buttons, list and grid switch, file checkboxes, and folder picker were not clicked in a browser, and they were not tried from a second computer.
 
 They do not fill a real disk, and they do not open a second physical computer. Trying the site from another computer on your LAN is a manual check: trust `portal.cer` there, open `https://<this-pc-lan-ip>:8443`, sign in, upload a file, and download it back.
 

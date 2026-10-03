@@ -12,12 +12,14 @@ import type { AppConfig } from './config.js';
 import { openDatabase } from './db.js';
 import {
   deleteOwnedFile,
+  deleteOwnedFiles,
   getReadyFile,
   listFiles,
   DEFAULT_PAGE_SIZE,
   displayedUsedBytes,
   MAX_PAGE_SIZE,
   markReady,
+  moveOwnedFiles,
   removeFileRecord,
   reservedBytes,
   stageFile,
@@ -26,10 +28,28 @@ import {
   breadcrumbs,
   createFolder,
   deleteFolder,
+  ensureFolderPath,
   listChildFolders,
   renameFolder,
   resolveFolder,
+  splitFolderPath,
 } from './folders.js';
+import { uniqueZipName, writeStoredZip } from './zip.js';
+import {
+  addToCollection,
+  attachTag,
+  collectionExists,
+  createCollection,
+  deleteCollection,
+  detachTag,
+  listCollections,
+  listTags,
+  removeFromCollection,
+  removeUnusedTags,
+  renameCollection,
+  setFavorite,
+  tagExists,
+} from './catalog.js';
 import { formatBytes } from './format.js';
 import { hashPassword, passwordProblem, verifyPassword } from './passwords.js';
 import { SqliteSessionStore } from './session-store.js';
@@ -196,15 +216,30 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
       res.status(404).json({ error: 'That folder is not in the portal.' });
       return;
     }
+    const favoriteOnly = req.query.favorite === '1';
+    const tagId = typeof req.query.tagId === 'string' ? req.query.tagId : '';
+    const collectionId = typeof req.query.collectionId === 'string' ? req.query.collectionId : '';
+    if (tagId && !tagExists(db, tagId)) {
+      res.status(404).json({ error: 'That tag is not in the portal.' });
+      return;
+    }
+    if (collectionId && !collectionExists(db, collectionId)) {
+      res.status(404).json({ error: 'That collection is not in the portal.' });
+      return;
+    }
+    const wide = Boolean(query || favoriteOnly || tagId || collectionId);
     const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
     const page = listFiles(db, {
       query,
       sort,
       order,
       userId: req.session.userId!,
-      folderId: query ? null : folder.folderId,
+      folderId: wide ? null : folder.folderId,
       limit,
       cursor,
+      favoriteOnly,
+      tagId: tagId || null,
+      collectionId: collectionId || null,
     });
     if (page === 'bad-sort') {
       res.status(400).json({ error: 'Sort by name, size, or date, in ascending or descending order.' });
@@ -216,7 +251,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     }
     res.json({
       files: page.files,
-      folders: query ? [] : listChildFolders(db, folder.folderId, req.session.userId!),
+      folders: wide ? [] : listChildFolders(db, folder.folderId, req.session.userId!),
       breadcrumbs: trail,
       page: { limit, nextCursor: page.nextCursor },
       storage: { usedBytes: displayedUsedBytes(db), limitBytes: config.maxStorageBytes },
@@ -258,6 +293,30 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     res.json({ folder: renamed.folder });
   });
 
+  app.post('/api/folders/ensure', requireAuth, requireCsrf, (req, res) => {
+    const parentRaw = req.body?.parentId;
+    if (parentRaw != null && parentRaw !== '' && typeof parentRaw !== 'string') {
+      res.status(400).json({ error: 'That folder is not in the portal.' });
+      return;
+    }
+    const parentId = typeof parentRaw === 'string' && parentRaw ? parentRaw : null;
+    if (parentId && !resolveFolder(db, parentId).ok) {
+      res.status(404).json({ error: 'That folder is not in the portal.' });
+      return;
+    }
+    const segments = splitFolderPath(typeof req.body?.path === 'string' ? req.body.path : '');
+    if (!segments) {
+      res.status(400).json({ error: 'That folder name cannot be used.' });
+      return;
+    }
+    const ensured = ensureFolderPath(db, parentId, segments, req.session.userId!);
+    if (!ensured.ok) {
+      sendFolderFailure(res, ensured.reason);
+      return;
+    }
+    res.status(201).json({ folderId: ensured.folderId, created: ensured.created });
+  });
+
   app.delete('/api/folders/:id', requireAuth, requireCsrf, (req, res) => {
     const removed = deleteFolder(db, routeId(req), req.session.userId!);
     if (!removed.ok) {
@@ -290,6 +349,136 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
       slots,
       openTemp: options.openTemp,
     }).catch(next);
+  });
+
+  app.post('/api/files/move', requireAuth, requireCsrf, (req, res) => {
+    const ids = readIds(req.body?.ids);
+    if (!ids) {
+      res.status(400).json({ error: 'Choose 1 to 100 files.' });
+      return;
+    }
+    const folderRaw = req.body?.folderId;
+    if (folderRaw != null && typeof folderRaw !== 'string') {
+      res.status(400).json({ error: 'That folder is not in the portal.' });
+      return;
+    }
+    const folder = resolveFolder(db, typeof folderRaw === 'string' && folderRaw ? folderRaw : null);
+    if (!folder.ok) {
+      res.status(404).json({ error: 'That folder is not in the portal.' });
+      return;
+    }
+    res.json(moveOwnedFiles(db, req.session.userId!, ids, folder.folderId));
+  });
+
+  app.post('/api/files/delete-many', requireAuth, requireCsrf, (req, res, next) => {
+    void handleDeleteMany(req, res, db, config).catch(next);
+  });
+
+  app.get('/api/tags', requireAuth, (_req, res) => {
+    res.json({ tags: listTags(db) });
+  });
+
+  app.post('/api/files/tags', requireAuth, requireCsrf, (req, res) => {
+    const ids = readIds(req.body?.ids);
+    const name = typeof req.body?.name === 'string' ? req.body.name : '';
+    if (!ids) {
+      res.status(400).json({ error: 'Choose 1 to 100 files.' });
+      return;
+    }
+    const tagged = attachTag(db, req.session.userId!, ids, name);
+    if (!tagged.ok) {
+      res.status(400).json({ error: 'That tag name cannot be used.' });
+      return;
+    }
+    res.status(201).json(tagged);
+  });
+
+  app.post('/api/files/:id/favorite', requireAuth, requireCsrf, (req, res) => {
+    if (!setFavorite(db, req.session.userId!, routeId(req), true)) {
+      res.status(404).json({ error: 'That file is not in the portal.' });
+      return;
+    }
+    res.json({ favorite: true });
+  });
+
+  app.delete('/api/files/:id/favorite', requireAuth, requireCsrf, (req, res) => {
+    if (!setFavorite(db, req.session.userId!, routeId(req), false)) {
+      res.status(404).json({ error: 'That file is not in the portal.' });
+      return;
+    }
+    res.json({ favorite: false });
+  });
+
+  app.delete('/api/files/:id/tags/:tagId', requireAuth, requireCsrf, (req, res) => {
+    const tagId = typeof req.params.tagId === 'string' ? req.params.tagId : '';
+    if (!detachTag(db, routeId(req), tagId)) {
+      res.status(404).json({ error: 'That tag is not on the file.' });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/collections', requireAuth, (req, res) => {
+    res.json({ collections: listCollections(db, req.session.userId!) });
+  });
+
+  app.post('/api/collections', requireAuth, requireCsrf, (req, res) => {
+    const created = createCollection(db, req.session.userId!, typeof req.body?.name === 'string' ? req.body.name : '');
+    if (!created.ok) {
+      sendCatalogFailure(res, created.reason);
+      return;
+    }
+    res.status(201).json({ collection: created.collection });
+  });
+
+  app.patch('/api/collections/:id', requireAuth, requireCsrf, (req, res) => {
+    const renamed = renameCollection(
+      db,
+      routeId(req),
+      req.session.userId!,
+      typeof req.body?.name === 'string' ? req.body.name : '',
+    );
+    if (!renamed.ok) {
+      sendCatalogFailure(res, renamed.reason);
+      return;
+    }
+    res.json({ collection: renamed.collection });
+  });
+
+  app.delete('/api/collections/:id', requireAuth, requireCsrf, (req, res) => {
+    const removed = deleteCollection(db, routeId(req), req.session.userId!);
+    if (removed !== 'deleted') {
+      sendCatalogFailure(res, removed);
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/collections/:id/files', requireAuth, requireCsrf, (req, res) => {
+    const ids = readIds(req.body?.ids);
+    if (!ids) {
+      res.status(400).json({ error: 'Choose 1 to 100 files.' });
+      return;
+    }
+    const added = addToCollection(db, routeId(req), req.session.userId!, ids);
+    if (!added.ok) {
+      res.status(404).json({ error: 'That collection is not in the portal.' });
+      return;
+    }
+    res.json(added);
+  });
+
+  app.delete('/api/collections/:id/files/:fileId', requireAuth, requireCsrf, (req, res) => {
+    const fileId = typeof req.params.fileId === 'string' ? req.params.fileId : '';
+    if (!removeFromCollection(db, routeId(req), fileId)) {
+      res.status(404).json({ error: 'That file is not in the collection.' });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/files/zip', requireAuth, (req, res, next) => {
+    void handleZip(req, res, db, config).catch(next);
   });
 
   app.get('/api/files/:id/download', requireAuth, (req, res, next) => {
@@ -787,6 +976,22 @@ function readPageLimit(raw: unknown): number | null {
   return value;
 }
 
+function sendCatalogFailure(res: Response, reason: string): void {
+  if (reason === 'bad-name') {
+    res.status(400).json({ error: 'That name cannot be used.' });
+    return;
+  }
+  if (reason === 'duplicate') {
+    res.status(409).json({ error: 'That name is already in use.' });
+    return;
+  }
+  if (reason === 'forbidden') {
+    res.status(403).json({ error: 'You can change only collections you created.' });
+    return;
+  }
+  res.status(404).json({ error: 'That collection is not in the portal.' });
+}
+
 function sendFolderFailure(res: Response, reason: string): void {
   if (reason === 'bad-name') {
     res.status(400).json({ error: 'That folder name cannot be used.' });
@@ -1019,6 +1224,71 @@ async function handleDownload(req: Request, res: Response, db: DatabaseSync, con
   });
 }
 
+async function handleDeleteMany(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const ids = readIds(req.body?.ids);
+  if (!ids) {
+    res.status(400).json({ error: 'Choose 1 to 100 files.' });
+    return;
+  }
+  const result = deleteOwnedFiles(db, req.session.userId!, ids);
+  for (const id of result.deleted) {
+    const finalPath = objectPath(config.storageDir, id);
+    if (!finalPath) continue;
+    try {
+      await rm(finalPath, { force: true });
+    } catch (error) {
+      console.error(`stored file remained after delete (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
+    }
+  }
+  removeUnusedTags(db);
+  res.json(result);
+}
+
+async function handleZip(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const raw = typeof req.query.ids === 'string' ? req.query.ids.split(',') : [];
+  const ids = readIds(raw);
+  if (!ids) {
+    res.status(400).json({ error: 'Choose 1 to 100 files.' });
+    return;
+  }
+  const used = new Set<string>();
+  const entries: Array<{ name: string; filePath: string; size: number }> = [];
+  for (const id of ids) {
+    const record = getReadyFile(db, id, req.session.userId!);
+    const finalPath = record ? objectPath(config.storageDir, record.id) : null;
+    const size = finalPath ? await fileSize(finalPath) : null;
+    if (!record || !finalPath || size !== record.sizeBytes) {
+      res.status(404).json({ error: 'One of those files is not in the portal.' });
+      return;
+    }
+    entries.push({ name: uniqueZipName(used, record.originalName), filePath: finalPath, size });
+  }
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', attachmentDisposition('portal-files.zip'));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    await writeStoredZip(res, entries);
+    res.end();
+  } catch (error) {
+    console.error(`zip failed (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'The files could not be packed.' });
+    } else {
+      res.destroy();
+    }
+  }
+}
+
+const BULK_LIMIT = 100;
+const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > BULK_LIMIT) return null;
+  if (!value.every((id) => typeof id === 'string' && ID_RE.test(id))) return null;
+  return [...new Set(value)];
+}
+
 async function handleDelete(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
   const id = req.params.id;
   if (!objectPath(config.storageDir, id)) {
@@ -1042,5 +1312,6 @@ async function handleDelete(req: Request, res: Response, db: DatabaseSync, confi
       console.error(`stored file remained after delete (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
     }
   }
+  removeUnusedTags(db);
   res.json({ ok: true });
 }

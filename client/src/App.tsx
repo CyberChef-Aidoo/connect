@@ -1,24 +1,41 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import {
+  addToCollection,
   ApiError,
+  createCollection,
   createFolder,
+  deleteCollection,
   deleteFile,
+  deleteFiles,
   deleteFolder,
   deleteUpload,
+  detachTag,
+  ensureFolder,
   getSession,
+  listCollections,
   listFiles,
+  listTags,
   listUploads,
   login,
   logout,
+  moveFiles,
+  removeFromCollection,
+  renameCollection,
   renameFolder,
+  setFavorite,
+  tagFiles,
   uploadFile,
+  zipUrl,
   type Breadcrumb,
+  type CollectionItem,
   type FileList,
   type FolderItem,
   type PortalFile,
   type Session,
+  type TagItem,
   type UploadSession,
 } from './api';
+import { folderPlacement, readDataTransfer, type PlannedUpload } from './folderUpload';
 import { formatBytes, formatWhen } from './format';
 import { selectionMatchesSession } from './resumeMatch';
 import { formatRemaining, formatSpeed, rememberSample, transferView, type TransferSample } from './transfer';
@@ -191,6 +208,17 @@ function Dashboard({
   const [cursorStack, setCursorStack] = useState<Array<string | null>>([]);
   const [view, setView] = useState<'list' | 'grid'>(readView);
   const [folderDraft, setFolderDraft] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [tagId, setTagId] = useState('');
+  const [collectionId, setCollectionId] = useState('');
+  const [tags, setTags] = useState<TagItem[]>([]);
+  const [collections, setCollections] = useState<CollectionItem[]>([]);
+  const [tagDraft, setTagDraft] = useState('');
+  const [collectionDraft, setCollectionDraft] = useState('');
+  const [bulkCollectionId, setBulkCollectionId] = useState('');
+  const [collectionName, setCollectionName] = useState('');
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
   const started = useRef(new Set<string>());
   const controllers = useRef(new Map<string, AbortController>());
@@ -238,16 +266,29 @@ function Dashboard({
     const [sortKey, order] = sort.split(':') as [string, string];
     setLoading(true);
     try {
-      const next = await listFiles(search, sortKey, order, folderId, cursor, PAGE_SIZE);
+      const filters = {
+        favorite: favoriteOnly,
+        tagId: tagId || undefined,
+        collectionId: collectionId || undefined,
+      };
+      const [next, tagList, collectionList] = await Promise.all([
+        listFiles(search, sortKey, order, folderId, cursor, PAGE_SIZE, filters),
+        listTags(),
+        listCollections(),
+      ]);
       setListing(next);
+      setTags(tagList.tags);
+      setCollections(collectionList.collections);
       setListError('');
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 401) {
         onSession(null);
         return;
       }
-      if (caught instanceof ApiError && caught.status === 404 && folderId) {
-        setFolderId(null);
+      if (caught instanceof ApiError && caught.status === 404 && (folderId || tagId || collectionId)) {
+        if (folderId) setFolderId(null);
+        if (tagId) setTagId('');
+        if (collectionId) setCollectionId('');
         setCursor(null);
         setCursorStack([]);
       }
@@ -287,7 +328,7 @@ function Dashboard({
     void refresh();
     // refresh is recreated each render; the query values are the real dependencies.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, sort, csrf, folderId, cursor]);
+  }, [search, sort, csrf, folderId, cursor, favoriteOnly, tagId, collectionId]);
 
   useEffect(() => {
     void loadPending();
@@ -402,15 +443,48 @@ function Dashboard({
   }
 
   function addFiles(incoming: File[]) {
+    queueUploads(incoming.map((file) => ({ file, folderId })));
+  }
+
+  async function addPlanned(incoming: PlannedUpload[]) {
     if (incoming.length === 0) return;
-    const next: UploadItem[] = incoming.map((file) => {
+    const groups = new Map<string, { directories: string[]; files: File[] }>();
+    for (const item of incoming) {
+      const place = folderPlacement(item.relativePath || item.file.name);
+      if (!place) continue;
+      const key = place.directories.join('/');
+      const group = groups.get(key) ?? { directories: place.directories, files: [] };
+      group.files.push(item.file);
+      groups.set(key, group);
+    }
+    const ready: Array<{ file: File; folderId: string | null }> = [];
+    try {
+      for (const group of groups.values()) {
+        let target = folderId;
+        if (group.directories.length > 0) {
+          const ensured = await ensureFolder(group.directories.join('/'), folderId, csrf);
+          target = ensured.folderId;
+        }
+        for (const file of group.files) ready.push({ file, folderId: target });
+      }
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The folders could not be created.');
+      return;
+    }
+    queueUploads(ready);
+    if (ready.length > 0) await refresh();
+  }
+
+  function queueUploads(incoming: Array<{ file: File; folderId: string | null }>) {
+    if (incoming.length === 0) return;
+    const next: UploadItem[] = incoming.map(({ file, folderId: target }) => {
       const tooBig = file.size > session.limits.maxFileBytes;
       return {
         id: crypto.randomUUID(),
         attempt: 1,
         file,
         sessionId: null,
-        folderId,
+        folderId: target,
         loaded: 0,
         total: file.size,
         progress: 0,
@@ -499,8 +573,29 @@ function Dashboard({
 
   function changeSort(value: SortValue) {
     setSort(value);
+    resetPage();
+  }
+
+  function resetPage() {
     setCursor(null);
     setCursorStack([]);
+  }
+
+  function chooseFavorite(on: boolean) {
+    setFavoriteOnly(on);
+    resetPage();
+  }
+
+  function chooseTag(id: string) {
+    setTagId(id);
+    resetPage();
+  }
+
+  function chooseCollection(id: string) {
+    setCollectionId(id);
+    const match = collections.find((item) => item.id === id);
+    setCollectionName(match?.name ?? '');
+    resetPage();
   }
 
   function chooseView(next: 'list' | 'grid') {
@@ -521,6 +616,138 @@ function Dashboard({
       setCursor(stack[stack.length - 1] ?? null);
       return stack.slice(0, -1);
     });
+  }
+
+  function toggleSelected(id: string, checked: boolean) {
+    setConfirmBulkDelete(false);
+    setSelected((current) => (checked ? [...new Set([...current, id])] : current.filter((item) => item !== id)));
+  }
+
+  function togglePage(ids: string[], checked: boolean) {
+    setConfirmBulkDelete(false);
+    setSelected((current) => {
+      if (checked) return [...new Set([...current, ...ids])];
+      const drop = new Set(ids);
+      return current.filter((id) => !drop.has(id));
+    });
+  }
+
+  async function moveSelected() {
+    if (selected.length === 0) return;
+    if (selected.length > 100) {
+      setListError('Choose 100 files or fewer at a time.');
+      return;
+    }
+    setListError('');
+    try {
+      const result = await moveFiles(selected, folderId, csrf);
+      setSelected((current) => current.filter((id) => !result.moved.includes(id)));
+      const left = result.skipped.length;
+      setBanner(left > 0
+        ? `Moved ${result.moved.length}. Left ${left} that you did not upload.`
+        : `Moved ${result.moved.length}.`);
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The files could not be moved.');
+    }
+  }
+
+  async function deleteSelected() {
+    if (selected.length === 0) return;
+    if (selected.length > 100) {
+      setListError('Choose 100 files or fewer at a time.');
+      return;
+    }
+    setListError('');
+    try {
+      const result = await deleteFiles(selected, csrf);
+      setSelected((current) => current.filter((id) => !result.deleted.includes(id)));
+      setConfirmBulkDelete(false);
+      const left = result.skipped.length;
+      setBanner(left > 0
+        ? `Deleted ${result.deleted.length}. Left ${left} that you did not upload.`
+        : `Deleted ${result.deleted.length}.`);
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The files could not be deleted.');
+    }
+  }
+
+  async function tagSelected() {
+    if (selected.length === 0 || !tagDraft.trim()) return;
+    if (selected.length > 100) {
+      setListError('Choose 100 files or fewer at a time.');
+      return;
+    }
+    setListError('');
+    try {
+      await tagFiles(selected, tagDraft, csrf);
+      setTagDraft('');
+      setBanner('Tag saved.');
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The tag could not be saved.');
+    }
+  }
+
+  async function collectSelected() {
+    if (selected.length === 0 || !bulkCollectionId) return;
+    if (selected.length > 100) {
+      setListError('Choose 100 files or fewer at a time.');
+      return;
+    }
+    setListError('');
+    try {
+      await addToCollection(bulkCollectionId, selected, csrf);
+      setBanner('Added to the collection.');
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The files could not be added to the collection.');
+    }
+  }
+
+  async function makeCollection(event: FormEvent) {
+    event.preventDefault();
+    if (!collectionDraft.trim()) return;
+    setListError('');
+    try {
+      const created = await createCollection(collectionDraft, csrf);
+      setCollectionDraft('');
+      setCollectionId(created.id);
+      setCollectionName(created.name);
+      resetPage();
+      setBanner(`Collection “${created.name}” created.`);
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The collection could not be created.');
+    }
+  }
+
+  async function saveCollectionName(event: FormEvent) {
+    event.preventDefault();
+    if (!collectionId || !collectionName.trim()) return;
+    setListError('');
+    try {
+      await renameCollection(collectionId, collectionName, csrf);
+      setBanner('Collection renamed.');
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The collection could not be renamed.');
+    }
+  }
+
+  async function removeCollection() {
+    if (!collectionId) return;
+    setListError('');
+    try {
+      await deleteCollection(collectionId, csrf);
+      setCollectionId('');
+      setCollectionName('');
+      resetPage();
+      setBanner('Collection deleted. The files are still in the portal.');
+      await refresh();
+    } catch (caught) {
+      setListError(caught instanceof ApiError ? caught.message : 'The collection could not be deleted.');
+    }
   }
 
   async function makeFolder(name: string) {
@@ -584,6 +811,7 @@ function Dashboard({
 
       <UploadZone
         onFiles={addFiles}
+        onPlanned={(items) => void addPlanned(items)}
         uploads={uploads}
         concurrency={Math.min(concurrency, pageCap)}
         pageCap={pageCap}
@@ -606,6 +834,37 @@ function Dashboard({
           onOpen={openFolder}
           onCreate={(name) => void makeFolder(name)}
         />
+        {selected.length > 0 ? (
+          <div className="bulk">
+            <span>{selected.length} selected</span>
+            <button type="button" onClick={() => void moveSelected()}>Move to this folder</button>
+            {confirmBulkDelete ? (
+              <>
+                <span>Delete the files you uploaded?</span>
+                <button type="button" className="danger" onClick={() => void deleteSelected()}>Delete</button>
+                <button type="button" className="ghost" onClick={() => setConfirmBulkDelete(false)}>Keep</button>
+              </>
+            ) : (
+              <button type="button" className="danger" onClick={() => setConfirmBulkDelete(true)}>Delete selected</button>
+            )}
+            {selected.length <= 100 ? <a className="button" href={zipUrl(selected)}>Download zip</a> : null}
+            <input
+              aria-label="Tag for selected files"
+              value={tagDraft}
+              placeholder="Tag"
+              list="portal-tags"
+              onChange={(event) => setTagDraft(event.target.value)}
+            />
+            <button type="button" onClick={() => void tagSelected()}>Tag selected</button>
+            <label className="sr" htmlFor="bulk-collection">Collection for selected files</label>
+            <select id="bulk-collection" value={bulkCollectionId} onChange={(event) => setBulkCollectionId(event.target.value)}>
+              <option value="">Add to collection</option>
+              {collections.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
+            <button type="button" disabled={!bulkCollectionId} onClick={() => void collectSelected()}>Add to collection</button>
+            <button type="button" className="ghost" onClick={() => { setSelected([]); setConfirmBulkDelete(false); }}>Clear</button>
+          </div>
+        ) : null}
         <div className="toolbar">
           <label>
             Search
@@ -622,13 +881,50 @@ function Dashboard({
               {SORTS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
+          <button type="button" className="ghost" aria-pressed={favoriteOnly} onClick={() => chooseFavorite(!favoriteOnly)}>Favorites</button>
+          <label>
+            Tag
+            <select value={tagId} onChange={(event) => chooseTag(event.target.value)}>
+              <option value="">Every file</option>
+              {tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
+            </select>
+          </label>
+          <label>
+            Collection
+            <select value={collectionId} onChange={(event) => chooseCollection(event.target.value)}>
+              <option value="">Every file</option>
+              {collections.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
+          </label>
+          <form className="inline-rename" onSubmit={(event) => void makeCollection(event)}>
+            <label>
+              New collection
+              <input value={collectionDraft} onChange={(event) => setCollectionDraft(event.target.value)} />
+            </label>
+            <button type="submit">Create</button>
+          </form>
+          {collections.find((item) => item.id === collectionId)?.canRename ? (
+            <form className="inline-rename" onSubmit={(event) => void saveCollectionName(event)}>
+              <label>
+                Rename collection
+                <input value={collectionName} onChange={(event) => setCollectionName(event.target.value)} />
+              </label>
+              <button type="submit">Save</button>
+            </form>
+          ) : null}
+          {collections.find((item) => item.id === collectionId)?.canDelete ? (
+            <button type="button" className="ghost danger" onClick={() => void removeCollection()}>Delete collection</button>
+          ) : null}
           <div className="view-toggle" role="group" aria-label="Layout">
             <button type="button" className="ghost" aria-pressed={view === 'list'} onClick={() => chooseView('list')}>List</button>
             <button type="button" className="ghost" aria-pressed={view === 'grid'} onClick={() => chooseView('grid')}>Grid</button>
           </div>
         </div>
+        <datalist id="portal-tags">
+          {tags.map((tag) => <option key={tag.id} value={tag.name} />)}
+        </datalist>
         <FolderList
-          folders={search ? [] : (listing?.folders ?? [])}
+          folders={search || favoriteOnly || tagId || collectionId ? [] : (listing?.folders ?? [])}
           csrfToken={csrf}
           onOpen={openFolder}
           onChanged={refresh}
@@ -638,8 +934,11 @@ function Dashboard({
           <FileGrid
             files={listing?.files ?? []}
             loading={loading}
-            searching={search.length > 0}
-            hasFolders={!search && (listing?.folders?.length ?? 0) > 0}
+            searching={search.length > 0 || favoriteOnly || Boolean(tagId || collectionId)}
+            hasFolders={!search && !favoriteOnly && !tagId && !collectionId && (listing?.folders?.length ?? 0) > 0}
+            selected={selected}
+            collectionId={collectionId}
+            onToggle={toggleSelected}
             csrfToken={csrf}
             onChanged={refresh}
             onError={setListError}
@@ -648,8 +947,12 @@ function Dashboard({
           <FileTable
             files={listing?.files ?? []}
             loading={loading}
-            searching={search.length > 0}
-            hasFolders={!search && (listing?.folders?.length ?? 0) > 0}
+            searching={search.length > 0 || favoriteOnly || Boolean(tagId || collectionId)}
+            hasFolders={!search && !favoriteOnly && !tagId && !collectionId && (listing?.folders?.length ?? 0) > 0}
+            selected={selected}
+            collectionId={collectionId}
+            onToggle={toggleSelected}
+            onTogglePage={togglePage}
             csrfToken={csrf}
             onChanged={refresh}
             onError={setListError}
@@ -722,6 +1025,7 @@ function ResumeRow({
 
 function UploadZone({
   onFiles,
+  onPlanned,
   uploads,
   concurrency,
   pageCap,
@@ -732,6 +1036,7 @@ function UploadZone({
   statusSummary,
 }: {
   onFiles: (files: File[]) => void;
+  onPlanned: (items: PlannedUpload[]) => void;
   uploads: UploadItem[];
   concurrency: number;
   pageCap: number;
@@ -742,6 +1047,8 @@ function UploadZone({
   statusSummary: string;
 }) {
   const inputId = useId();
+  const folderInputId = useId();
+  const folderPicker = typeof document !== 'undefined' && 'webkitdirectory' in document.createElement('input');
   const [hot, setHot] = useState(false);
   const [live, setLive] = useState('');
   const finished = uploads.some((item) => item.status === 'done' || item.status === 'error' || item.status === 'canceled');
@@ -768,14 +1075,17 @@ function UploadZone({
         onDrop={(event) => {
           event.preventDefault();
           setHot(false);
-          onFiles(Array.from(event.dataTransfer.files));
+          void readDataTransfer(event.dataTransfer).then(onPlanned);
         }}
       >
         <div>
           <h2>Upload</h2>
-          <p>Drop files here, or choose them. New files go in the open folder. Folders from your computer are not uploaded. If you leave this page, choose the same file again to continue. Saved progress is kept for 24 hours.</p>
+          <p>Drop files here, or choose them. New files go in the open folder. Choose a folder when this browser allows it. Otherwise choose the files. If you leave this page, choose the same file again to continue. Saved progress is kept for 24 hours.</p>
         </div>
-        <label className="button" htmlFor={inputId}>Choose files</label>
+        <div className="drop-actions">
+          <label className="button" htmlFor={inputId}>Choose files</label>
+          {folderPicker ? <label className="button" htmlFor={folderInputId}>Choose folder</label> : null}
+        </div>
         <input
           id={inputId}
           type="file"
@@ -785,6 +1095,22 @@ function UploadZone({
             event.target.value = '';
           }}
         />
+        {folderPicker ? (
+          <input
+            id={folderInputId}
+            type="file"
+            multiple
+            ref={(node) => { if (node) node.setAttribute('webkitdirectory', ''); }}
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              onPlanned(files.map((file) => ({
+                file,
+                relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+              })));
+              event.target.value = '';
+            }}
+          />
+        ) : null}
       </div>
       <p className="sr" role="status" aria-live="polite">{live}</p>
       {uploads.length > 0 ? (
@@ -994,6 +1320,10 @@ function FileTable({
   loading,
   searching,
   hasFolders,
+  selected,
+  collectionId,
+  onToggle,
+  onTogglePage,
   csrfToken,
   onChanged,
   onError,
@@ -1002,6 +1332,10 @@ function FileTable({
   loading: boolean;
   searching: boolean;
   hasFolders: boolean;
+  selected: string[];
+  collectionId: string;
+  onToggle: (id: string, checked: boolean) => void;
+  onTogglePage: (ids: string[], checked: boolean) => void;
   csrfToken: string;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
@@ -1030,7 +1364,7 @@ function FileTable({
     if (hasFolders) return <p className="status">No files in this folder.</p>;
     return (
       <p className="status">
-        {searching ? 'No files match that search.' : 'No files yet. Upload the first one.'}
+        {searching ? 'No files match.' : 'No files yet. Upload the first one.'}
       </p>
     );
   }
@@ -1041,6 +1375,14 @@ function FileTable({
         <caption>You can delete files you uploaded. Anyone signed in can download.</caption>
         <thead>
           <tr>
+            <th scope="col">
+              <input
+                type="checkbox"
+                aria-label="Select every file on this page"
+                checked={files.length > 0 && files.every((file) => selected.includes(file.id))}
+                onChange={(event) => onTogglePage(files.map((file) => file.id), event.target.checked)}
+              />
+            </th>
             <th scope="col">Name</th>
             <th scope="col">Size</th>
             <th scope="col">Uploaded</th>
@@ -1051,6 +1393,14 @@ function FileTable({
         <tbody>
           {files.map((file) => (
             <tr key={file.id}>
+              <td>
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${file.originalName}`}
+                  checked={selected.includes(file.id)}
+                  onChange={(event) => onToggle(file.id, event.target.checked)}
+                />
+              </td>
               <td className="filename">
                 {file.originalName}
                 {searching && file.folderName ? <span className="meta"> In {file.folderName}</span> : null}
@@ -1086,6 +1436,8 @@ function FileGrid({
   loading,
   searching,
   hasFolders,
+  selected,
+  onToggle,
   csrfToken,
   onChanged,
   onError,
@@ -1094,6 +1446,8 @@ function FileGrid({
   loading: boolean;
   searching: boolean;
   hasFolders: boolean;
+  selected: string[];
+  onToggle: (id: string, checked: boolean) => void;
   csrfToken: string;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
@@ -1125,6 +1479,15 @@ function FileGrid({
     <ul className="grid">
       {files.map((file) => (
         <li key={file.id} className="tile">
+          <label className="pick">
+            <input
+              type="checkbox"
+              aria-label={`Select ${file.originalName}`}
+              checked={selected.includes(file.id)}
+              onChange={(event) => onToggle(file.id, event.target.checked)}
+            />
+            Select
+          </label>
           <strong className="filename">{file.originalName}</strong>
           <span className="meta">{formatBytes(file.sizeBytes)} · {file.ownerUsername}</span>
           {searching && file.folderName ? <span className="meta">In {file.folderName}</span> : null}
