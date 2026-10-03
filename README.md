@@ -15,7 +15,7 @@ The browser talks to this computer for the website, the stored files, and the sh
 ```
 browser on another PC
         |
-        |  HTTPS on the LAN (HTTP only while developing on this PC)
+        |  HTTP or HTTPS on the LAN
         v
 Express on this Windows PC
    |-- session cookie + CSRF header
@@ -108,7 +108,7 @@ Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object Name, MacAddress
 
 Use the address on your home or office network, often `192.168.x.x` or `10.x.x.x`. The other computer will use that address. `127.0.0.1` always means “this computer,” so it will not work from a laptop across the room.
 
-Example: if this PC’s address is `192.168.1.50`, the other computer opens `https://192.168.1.50:8443`.
+Example: if this PC’s address is `192.168.1.50`, the other computer opens `http://192.168.1.50:8443`. No certificate file is required. Traffic on the Wi-Fi is not encrypted. Do not forward this port on the router.
 
 ### 2. Keep that address from changing
 
@@ -118,9 +118,9 @@ In the router’s admin page, look for DHCP reservation, “static lease,” or 
 
 This is a setting on the router for your own LAN. It is not a port forward, and it does not expose the portal to the internet.
 
-### 3. Create an HTTPS certificate
+### 3. Optional: use HTTPS instead of HTTP
 
-Other computers must use HTTPS. The server will refuse to listen on a network address without a certificate.
+HTTP works with the `HOST` and `PORT` lines alone. Use a certificate only when you want the traffic encrypted. Other computers must then trust `portal.cer`, and they open `https://` instead of `http://`.
 
 Run this on the server PC, with the LAN address you just chose:
 
@@ -161,7 +161,7 @@ Then rebuild is unnecessary for a config change. Start the server again:
 npm start
 ```
 
-On the other computer, open `https://192.168.1.50:8443` (your address and port). Sign in with an account you created.
+On the other computer, open `http://192.168.1.50:8443` (your address and port). With the certificate enabled, use `https://` on that same address. Sign in with an account you created, unless `OPEN_ACCESS=1`.
 
 ### 4. Allow the port through Windows Firewall, privately
 
@@ -215,7 +215,7 @@ You can also start it by hand with `.\scripts\start-portal.ps1`.
 | `SESSION_SECRET` | Long random string. Required before other computers connect. |
 | `OPEN_ACCESS` | `1` opens the file list with no username or password. Leave it empty to require sign-in. |
 | `SESSION_TTL_HOURS` | How long a sign-in lasts. Default 12. |
-| `HTTPS_PFX_PATH` / `HTTPS_PFX_PASSPHRASE` | Certificate for LAN use. |
+| `HTTPS_PFX_PATH` / `HTTPS_PFX_PASSPHRASE` | Optional. Leave empty for HTTP on the LAN. Set these to serve HTTPS. |
 | `HTTPS_KEY_PATH` / `HTTPS_CERT_PATH` | Use these instead of a PFX if you already have a PEM key and certificate. |
 
 Paths in `.env` can be relative to the project folder or full Windows paths. Do not commit `.env`, the certificate, or the `data` folder.
@@ -327,7 +327,7 @@ The automated tests cover sign-in, anonymous requests, upload, list, search, sor
 
 The transfer list, folder buttons, list and grid switch, file checkboxes, folder picker, stars, tag chips, collection controls, preview dialog, bin, replace control, and Direct button were not clicked in a browser, and they were not tried from a second computer.
 
-They do not fill a real disk, and they do not open a second physical computer. Trying the site from another computer on your LAN is a manual check: trust `portal.cer` there, open `https://<this-pc-lan-ip>:8443`, sign in, upload a file, and download it back.
+They do not fill a real disk, and they do not open a second physical computer. Trying the site from another computer on your LAN is a manual check: open `http://<this-pc-lan-ip>:8443`, upload a file, and download it back. With HTTPS enabled, import `portal.cer` on that computer and use `https://`.
 
 ## Layout
 

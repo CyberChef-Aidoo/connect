@@ -43,6 +43,9 @@ server.listen(config.port, config.host, () => {
   }
   if (isLoopback(config.host)) {
     console.log('This address accepts connections only from this computer.');
+  } else if (!config.https) {
+    console.log('Other computers can open http://<this-pc-lan-ip>:' + config.port + '.');
+    console.log('HTTP is on for this network. Files are not encrypted between computers. Do not forward this port on the router.');
   } else {
     console.log('Other computers on this network can connect to this PC’s LAN address on the same port.');
   }

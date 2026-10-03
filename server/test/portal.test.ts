@@ -131,12 +131,13 @@ function appendChunk(
 }
 
 describe('configuration', () => {
-  it('refuses a network address without HTTPS', () => {
+  it('allows HTTP on a network address when a session secret is set', () => {
     const config = resolveConfig({
       HOST: '0.0.0.0',
       SESSION_SECRET: 'a-long-enough-session-secret',
     }, os.tmpdir());
-    assert.throws(() => assertBindSafety(config), /HTTPS/);
+    assert.equal(config.https, null);
+    assert.doesNotThrow(() => assertBindSafety(config));
   });
 
   it('requires a session secret before leaving this computer', () => {

@@ -96,11 +96,6 @@ export function resolveConfig(env: NodeJS.ProcessEnv, repoRoot: string): AppConf
 }
 
 export function assertBindSafety(config: AppConfig): void {
-  if (!isLoopback(config.host) && !config.https) {
-    throw new Error(
-      'Refusing to listen on a network address without HTTPS. Create a certificate and set HTTPS_PFX_PATH, or use HOST=127.0.0.1 for development on this computer only.',
-    );
-  }
   if (!isLoopback(config.host) && config.usingDevSessionSecret) {
     throw new Error('Set SESSION_SECRET in .env before listening on a network address.');
   }
