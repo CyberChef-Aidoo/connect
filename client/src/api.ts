@@ -30,6 +30,14 @@ export type PortalFile = {
   favorite?: boolean;
   tags?: TagItem[];
   preview?: 'image' | 'text' | 'none';
+  versionCount?: number;
+};
+
+export type FileVersion = {
+  id: string;
+  originalName: string;
+  sizeBytes: number;
+  createdAt: string;
 };
 
 export type TagItem = { id: string; name: string };
@@ -228,6 +236,32 @@ export async function restoreFile(id: string, csrfToken: string): Promise<void> 
 
 export async function purgeFile(id: string, csrfToken: string): Promise<void> {
   const response = await fetch(`/api/files/${encodeURIComponent(id)}/permanent`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function replaceFile(id: string, file: File, csrfToken: string): Promise<void> {
+  const body = new FormData();
+  body.set('file', file);
+  const response = await fetch(`/api/files/${encodeURIComponent(id)}/replace`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+    body,
+  });
+  await readJson(response);
+}
+
+export async function listVersions(id: string): Promise<{ versions: FileVersion[] }> {
+  const response = await fetch(`/api/files/${encodeURIComponent(id)}/versions`, { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function deleteVersion(fileId: string, versionId: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/files/${encodeURIComponent(fileId)}/versions/${encodeURIComponent(versionId)}`, {
     method: 'DELETE',
     credentials: 'same-origin',
     headers: { 'X-CSRF-Token': csrfToken },

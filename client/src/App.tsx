@@ -8,6 +8,7 @@ import {
   deleteFile,
   deleteFiles,
   deleteFolder,
+  deleteVersion,
   deleteUpload,
   detachTag,
   ensureFolder,
@@ -17,6 +18,7 @@ import {
   listFiles,
   listTags,
   listUploads,
+  listVersions,
   login,
   logout,
   moveFiles,
@@ -24,6 +26,7 @@ import {
   removeFromCollection,
   renameCollection,
   renameFolder,
+  replaceFile,
   restoreFile,
   setFavorite,
   tagFiles,
@@ -33,6 +36,7 @@ import {
   type Breadcrumb,
   type CollectionItem,
   type FileList,
+  type FileVersion,
   type FolderItem,
   type PortalFile,
   type Session,
@@ -1475,6 +1479,7 @@ function FileTable({
                 {file.preview === 'image' || file.preview === 'text' ? (
                   <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
                 ) : null}
+                <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
                 <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
                 {file.canDelete && pendingDelete !== file.id ? (
                   <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
