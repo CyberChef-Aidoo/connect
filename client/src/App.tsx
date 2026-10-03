@@ -1383,6 +1383,7 @@ function FileTable({
                 onChange={(event) => onTogglePage(files.map((file) => file.id), event.target.checked)}
               />
             </th>
+            <th scope="col"><span className="sr">Favorite</span></th>
             <th scope="col">Name</th>
             <th scope="col">Size</th>
             <th scope="col">Uploaded</th>
@@ -1399,6 +1400,15 @@ function FileTable({
                   aria-label={`Select ${file.originalName}`}
                   checked={selected.includes(file.id)}
                   onChange={(event) => onToggle(file.id, event.target.checked)}
+                />
+              </td>
+              <td>
+                <FileMarks
+                  file={file}
+                  collectionId={collectionId}
+                  csrfToken={csrfToken}
+                  onChanged={onChanged}
+                  onError={onError}
                 />
               </td>
               <td className="filename">
@@ -1437,6 +1447,7 @@ function FileGrid({
   searching,
   hasFolders,
   selected,
+  collectionId,
   onToggle,
   csrfToken,
   onChanged,
@@ -1447,6 +1458,7 @@ function FileGrid({
   searching: boolean;
   hasFolders: boolean;
   selected: string[];
+  collectionId: string;
   onToggle: (id: string, checked: boolean) => void;
   csrfToken: string;
   onChanged: () => Promise<void>;
@@ -1472,7 +1484,7 @@ function FileGrid({
   if (loading && files.length === 0) return <p className="status" role="status">Loading files…</p>;
   if (!loading && files.length === 0) {
     if (hasFolders) return <p className="status">No files in this folder.</p>;
-    return <p className="status">{searching ? 'No files match that search.' : 'No files yet. Upload the first one.'}</p>;
+    return <p className="status">{searching ? 'No files match.' : 'No files yet. Upload the first one.'}</p>;
   }
 
   return (
@@ -1488,6 +1500,13 @@ function FileGrid({
             />
             Select
           </label>
+          <FileMarks
+            file={file}
+            collectionId={collectionId}
+            csrfToken={csrfToken}
+            onChanged={onChanged}
+            onError={onError}
+          />
           <strong className="filename">{file.originalName}</strong>
           <span className="meta">{formatBytes(file.sizeBytes)} · {file.ownerUsername}</span>
           {searching && file.folderName ? <span className="meta">In {file.folderName}</span> : null}
