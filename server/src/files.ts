@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { sqlNumber, withImmediateTransaction } from './db.js';
 import { attachCatalog } from './catalog.js';
+import { previewKind } from './preview.js';
 import type { FileRecord } from './types.js';
 
 export type NewFile = {
@@ -42,6 +43,8 @@ export function usedBytes(db: DatabaseSync): number {
   ).get() as { used: unknown };
   return sqlNumber(row.used);
 }
+
+export const BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function readyBytes(db: DatabaseSync): number {
   const row = db.prepare(
@@ -119,7 +122,7 @@ export function listFiles(
 
   const params: Array<string | number> = [options.userId];
   const wide = Boolean(options.query || options.favoriteOnly || options.tagId || options.collectionId);
-  let where = "WHERE f.state = 'ready'";
+  let where = "WHERE f.state = 'ready' AND f.deleted_at IS NULL";
   if (options.query) {
     where += " AND f.original_name LIKE ? ESCAPE '\\'";
     params.push(likePattern(options.query));
@@ -173,7 +176,7 @@ export function getReadyFile(db: DatabaseSync, id: string, userId: string): File
     FROM files f
     JOIN users u ON u.id = f.owner_id
     LEFT JOIN folders d ON d.id = f.folder_id
-    WHERE f.id = ? AND f.state = 'ready'
+    WHERE f.id = ? AND f.state = 'ready' AND f.deleted_at IS NULL
   `).get(id) as FileRow | undefined;
   if (!row) return undefined;
   const file = mapFile(row, userId);
@@ -191,7 +194,7 @@ export function moveOwnedFiles(
 ): { moved: string[]; skipped: SkippedFile[] } {
   return withImmediateTransaction(db, () => applyOwnedChange(db, ownerId, ids, (id) => {
     const result = db.prepare(
-      "UPDATE files SET folder_id = ? WHERE id = ? AND owner_id = ? AND state = 'ready'",
+      "UPDATE files SET folder_id = ? WHERE id = ? AND owner_id = ? AND state = 'ready' AND deleted_at IS NULL",
     ).run(folderId, id, ownerId);
     return result.changes === 1;
   }));
@@ -204,8 +207,8 @@ export function deleteOwnedFiles(
 ): { deleted: string[]; skipped: SkippedFile[] } {
   const applied = withImmediateTransaction(db, () => applyOwnedChange(db, ownerId, ids, (id) => {
     const result = db.prepare(
-      "DELETE FROM files WHERE id = ? AND owner_id = ? AND state = 'ready'",
-    ).run(id, ownerId);
+      "UPDATE files SET deleted_at = ? WHERE id = ? AND owner_id = ? AND state = 'ready' AND deleted_at IS NULL",
+    ).run(new Date().toISOString(), id, ownerId);
     return result.changes === 1;
   }));
   return { deleted: applied.moved, skipped: applied.skipped };
@@ -225,7 +228,7 @@ function applyOwnedChange(
       continue;
     }
     const existing = db.prepare(
-      "SELECT owner_id FROM files WHERE id = ? AND state = 'ready'",
+      "SELECT owner_id FROM files WHERE id = ? AND state = 'ready' AND deleted_at IS NULL",
     ).get(id) as { owner_id: string } | undefined;
     skipped.push({ id, reason: existing && existing.owner_id !== ownerId ? 'forbidden' : 'missing' });
   }
@@ -234,13 +237,66 @@ function applyOwnedChange(
 
 export function deleteOwnedFile(db: DatabaseSync, id: string, ownerId: string): 'deleted' | 'missing' | 'forbidden' {
   const result = db.prepare(
-    "DELETE FROM files WHERE id = ? AND owner_id = ? AND state = 'ready'",
-  ).run(id, ownerId);
+    "UPDATE files SET deleted_at = ? WHERE id = ? AND owner_id = ? AND state = 'ready' AND deleted_at IS NULL",
+  ).run(new Date().toISOString(), id, ownerId);
   if (result.changes === 1) return 'deleted';
   const existing = db.prepare(
-    "SELECT owner_id FROM files WHERE id = ? AND state = 'ready'",
+    "SELECT owner_id FROM files WHERE id = ? AND state = 'ready' AND deleted_at IS NULL",
   ).get(id) as { owner_id: string } | undefined;
   return existing ? 'forbidden' : 'missing';
+}
+
+export type BinFile = FileRecord & { deletedAt: string };
+
+export function listBin(db: DatabaseSync, userId: string): BinFile[] {
+  const rows = db.prepare(`
+    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, f.deleted_at, u.username, d.name AS folder_name
+    FROM files f
+    JOIN users u ON u.id = f.owner_id
+    LEFT JOIN folders d ON d.id = f.folder_id
+    WHERE f.state = 'ready' AND f.deleted_at IS NOT NULL AND f.owner_id = ?
+    ORDER BY f.deleted_at DESC, f.id ASC
+  `).all(userId) as Array<FileRow & { deleted_at: string }>;
+  const files = rows.map((row) => ({ ...mapFile(row, userId), deletedAt: row.deleted_at }));
+  attachCatalog(db, files, userId);
+  return files;
+}
+
+export function restoreOwnedFile(db: DatabaseSync, id: string, ownerId: string): 'restored' | 'missing' | 'forbidden' {
+  const result = db.prepare(
+    "UPDATE files SET deleted_at = NULL WHERE id = ? AND owner_id = ? AND state = 'ready' AND deleted_at IS NOT NULL",
+  ).run(id, ownerId);
+  if (result.changes === 1) return 'restored';
+  const existing = db.prepare(
+    "SELECT owner_id FROM files WHERE id = ? AND state = 'ready' AND deleted_at IS NOT NULL",
+  ).get(id) as { owner_id: string } | undefined;
+  return existing ? 'forbidden' : 'missing';
+}
+
+export function purgeOwnedBinFile(db: DatabaseSync, id: string, ownerId: string): 'purged' | 'missing' | 'forbidden' {
+  const result = db.prepare(
+    "DELETE FROM files WHERE id = ? AND owner_id = ? AND state = 'ready' AND deleted_at IS NOT NULL",
+  ).run(id, ownerId);
+  if (result.changes === 1) return 'purged';
+  const existing = db.prepare(
+    "SELECT owner_id FROM files WHERE id = ? AND state = 'ready' AND deleted_at IS NOT NULL",
+  ).get(id) as { owner_id: string } | undefined;
+  return existing ? 'forbidden' : 'missing';
+}
+
+export function takeExpiredBinIds(db: DatabaseSync, nowMs = Date.now()): string[] {
+  const cutoff = new Date(nowMs - BIN_RETENTION_MS).toISOString();
+  return withImmediateTransaction(db, () => {
+    const rows = db.prepare(
+      "SELECT id FROM files WHERE state = 'ready' AND deleted_at IS NOT NULL AND deleted_at <= ?",
+    ).all(cutoff) as Array<{ id: string }>;
+    const remove = db.prepare('DELETE FROM files WHERE id = ? AND deleted_at IS NOT NULL');
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (remove.run(row.id).changes === 1) ids.push(row.id);
+    }
+    return ids;
+  });
 }
 
 export function listStaging(db: DatabaseSync): NewFile[] {
@@ -294,6 +350,7 @@ function mapFile(row: FileRow, userId: string): FileRecord {
     folderName: row.folder_name,
     favorite: false,
     tags: [],
+    preview: previewKind(row.original_name, sqlNumber(row.size_bytes)),
   };
 }
 

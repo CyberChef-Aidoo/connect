@@ -9,7 +9,7 @@ People sign in with their own username and password. Anyone who is signed in can
 
 Each file can be up to **2 GB**. The portal holds up to **50 GB** in total. Both limits are set in `.env`.
 
-Previews and sharing links are not part of this version. Files can be organized in shared folders. A folder can be chosen when the browser allows it; otherwise choose the files. An upload can continue after it stops, for 24 hours, when the same file is chosen again.
+Sharing links are not part of this version. A deleted file stays in your bin for 30 days and still counts toward the storage limit. Images within 8 MB and plain text can be previewed in the page. HTML, SVG, and other types are downloaded and are not shown as part of the site. Files can be organized in shared folders, tagged, and grouped into collections. A star is personal to the person who set it. A folder can be chosen when the browser allows it; otherwise choose the files. An upload can continue after it stops, for 24 hours, when the same file is chosen again.
 
 ## How it is put together
 
@@ -240,9 +240,10 @@ npm run create-user -- username
 1. Sign in.
 2. Drop files onto the page, choose files, or choose a folder when the browser offers that. A folder from your computer is recreated under the folder you have open. If the browser cannot pick a folder, choose the files instead. A path that tries to climb out with `..` stays inside the open folder. The transfer list shows waiting, active, finished, canceled, and failed files. An active file shows how much has been sent, the recent speed, and an estimate of the time left. If the transfer stops making progress, the row says it is stalled. Cancel removes that upload, including any part already saved. Retry continues from the last saved part when the upload is still on the server. You can run 1, 2, or 3 uploads at once; the server still enforces its own cap. Leaving or reloading the page stops the browser’s current transfer. Choose the same file again to continue. Saved progress stays for 24 hours. The page cannot resume a file by itself after a reload.
 3. Create a folder and open it from the breadcrumb trail. A new upload goes into the folder you have open. Anyone signed in can open every folder. Only the person who created a folder can rename it, and can delete it when it is empty. Search still looks through every folder. Sort by name, size, or date. Switch between the list and the grid. The file list is loaded one page at a time.
-4. Select files to move them into the open folder, delete them, or download them as one zip. Move and delete apply only to files you uploaded. A zip can include any selected file, because anyone signed in can already download it. Up to 100 files at a time. A single download still uses the browser’s own download, and the page does not show download progress.
-5. Delete is offered only for files you uploaded. The server checks that again; hiding the button is not the only check.
-6. The bar at the top shows how much of the 50 GB is in use, including space reserved by unfinished uploads.
+4. Select files to move them into the open folder, delete them, download them as one zip, tag them, or add them to a collection. Move and delete apply only to files you uploaded. A zip can include any selected file, because anyone signed in can already download it. Up to 100 files at a time. A single download still uses the browser’s own download, and the page does not show download progress.
+5. Star a file to keep it in your own Favorites list. Anyone signed in can add or remove a tag, and can add or remove a file from a collection. Only the person who created a collection can rename or delete it. Deleting a collection leaves the files in place. Favorites, a tag, and a collection each look through every folder.
+6. Preview is offered for a picture within 8 MB and for a text file. The picture also appears as a thumbnail. A text preview shows at most the first 256 KB. HTML and SVG stay as downloads, so a page or script in the portal cannot run. PDF, audio, and video stay as downloads. Delete is offered only for files you uploaded. The server checks that again; hiding the button is not the only check. Delete moves the file to your bin for 30 days. Restore puts it back in the same folder, or at the top level if that folder was deleted. Delete permanently removes it. The bin still counts toward the 50 GB limit. Another person cannot see or restore your bin.
+7. The bar at the top shows how much of the 50 GB is in use, including space reserved by unfinished uploads.
 
 An empty list, a loading line, a success note, and the server’s error text are shown on the page. A file that is too large, a full portal, a full disk, or a lost connection is reported as a failed upload and is not added to the list.
 
@@ -255,7 +256,7 @@ All `/api` routes require a signed-in session except `POST /api/auth/login`.
 | `POST` | `/api/auth/login` | Body `{ "username", "password" }`. Sets an HttpOnly session cookie. |
 | `POST` | `/api/auth/logout` | Ends the session. Requires the `X-CSRF-Token` header. |
 | `GET` | `/api/auth/me` | Current person, CSRF token, size limits, and upload caps. |
-| `GET` | `/api/files?q=&sort=name\|size\|date&order=asc\|desc&folderId=&cursor=&limit=` | Files in one folder, plus its subfolders, breadcrumbs, and the next page. A search looks through every folder. `limit` is 1 to 100 and defaults to 50. |
+| `GET` | `/api/files?q=&sort=name\|size\|date&order=asc\|desc&folderId=&cursor=&limit=&favorite=&tagId=&collectionId=` | Files in one folder, plus its subfolders, breadcrumbs, and the next page. A search, Favorites, a tag, or a collection looks through every folder. Each file includes `favorite` for the signed-in person and the shared `tags`. `limit` is 1 to 100 and defaults to 50. |
 | `POST` | `/api/folders` | Creates a shared folder. Body `{ "name", "parentId" }`. Requires `X-CSRF-Token`. |
 | `POST` | `/api/folders/ensure` | Creates any missing folders in a relative path. Body `{ "path", "parentId" }`. Requires `X-CSRF-Token`. |
 | `POST` | `/api/files/move` | Moves files you uploaded. Body `{ "ids", "folderId" }`. `folderId` may be null for the top level. Requires `X-CSRF-Token`. |
@@ -268,8 +269,24 @@ All `/api` routes require a signed-in session except `POST /api/auth/login`.
 | `PATCH` | `/api/uploads/:id` | Appends one part. Raw `application/octet-stream`, with `Upload-Offset` and `Content-Length`. Requires `X-CSRF-Token`. |
 | `DELETE` | `/api/uploads/:id` | Cancels an unfinished upload owned by the signed-in person. Requires `X-CSRF-Token`. |
 | `POST` | `/api/files` | One-shot multipart upload, field name `file`. Requires `X-CSRF-Token`. |
+| `GET` | `/api/tags` | Shared tags. |
+| `POST` | `/api/files/tags` | Adds one tag to up to 100 files. Body `{ "ids", "name" }`. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/files/:id/tags/:tagId` | Removes a shared tag from a file. Requires `X-CSRF-Token`. |
+| `POST` | `/api/files/:id/favorite` | Adds the file to the signed-in person’s favorites. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/files/:id/favorite` | Removes the file from the signed-in person’s favorites. Requires `X-CSRF-Token`. |
+| `GET` | `/api/collections` | Shared collections. `canRename` and `canDelete` are true for the person who created one. |
+| `POST` | `/api/collections` | Creates a collection. Body `{ "name" }`. Requires `X-CSRF-Token`. |
+| `PATCH` | `/api/collections/:id` | Renames a collection the signed-in person created. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/collections/:id` | Deletes a collection the signed-in person created. The files stay. Requires `X-CSRF-Token`. |
+| `POST` | `/api/collections/:id/files` | Adds up to 100 files to a collection. Body `{ "ids" }`. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/collections/:id/files/:fileId` | Removes a file from a collection. Requires `X-CSRF-Token`. |
+| `GET` | `/api/files/:id/preview` | Image or plain text for a signed-in person. HTML and other types are refused. A long text file is cut off at 256 KB. |
+| `GET` | `/api/files/:id/thumbnail` | A picture for a signed-in person, only when the file is an image of 8 MB or less. A generated thumbnail is used when `ffmpeg` is installed. Otherwise the original image is sent. |
 | `GET` | `/api/files/:id/download` | Streams the file as a download. |
-| `DELETE` | `/api/files/:id` | Deletes a file the signed-in person uploaded. Requires `X-CSRF-Token`. |
+| `GET` | `/api/bin` | Files the signed-in person deleted. They remain for 30 days. |
+| `POST` | `/api/files/:id/restore` | Puts one of those files back. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/files/:id/permanent` | Removes a binned file and its stored bytes. Requires `X-CSRF-Token`. |
+| `DELETE` | `/api/files/:id` | Moves a file the signed-in person uploaded into the bin. Requires `X-CSRF-Token`. |
 
 The cookie is `HttpOnly` and `SameSite=Strict`. On HTTPS it is also `Secure`. State-changing requests must send the CSRF token from the login or session response.
 
@@ -278,14 +295,19 @@ The cookie is `HttpOnly` and `SameSite=Strict`. On HTTPS it is also `Secure`. St
 ```sql
 users (id, username, password_hash, created_at)
 sessions (sid, sess, expired)
-files (id, owner_id, original_name, size_bytes, created_at, state, folder_id)
+files (id, owner_id, original_name, size_bytes, created_at, state, folder_id, deleted_at)
 upload_sessions (id, owner_id, original_name, size_bytes, received_bytes, created_at, updated_at, expires_at, folder_id)
 folders (id, parent_id, name, created_by, created_at)
+tags (id, name, created_by, created_at)
+file_tags (file_id, tag_id, created_by, created_at)
+favorites (user_id, file_id, created_at)
+collections (id, name, created_by, created_at)
+collection_files (collection_id, file_id, added_by, created_at)
 ```
 
-`files.folder_id` is empty at the top level. Folder names are display names. They are never used as a directory on disk.
+`files.folder_id` is empty at the top level. Folder names, tag names, and collection names are display names. They are never used as a directory on disk. A favorite row belongs to one person. Tags and collections are visible to everyone who is signed in. Thumbnail files, when `ffmpeg` creates them, live under `thumbs` and are removed with the file. They are not a second copy you can download by name.
 
-`state` is `staging` while a finished upload is being published, then `ready`. The list and downloads only use `ready`. Passwords are stored as bcrypt hashes. Session cookies and passwords are not written to the log.
+`state` is `staging` while a finished upload is being published, then `ready`. The list and downloads only use `ready` files whose `deleted_at` is empty. A binned file keeps `deleted_at` and still counts toward the storage limit until it is restored, removed, or 30 days have passed. Passwords are stored as bcrypt hashes. Session cookies and passwords are not written to the log.
 
 ## Tests
 
@@ -293,9 +315,9 @@ folders (id, parent_id, name, created_by, created_at)
 npm test
 ```
 
-The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, creating a user from the command line, resumable uploads, shared folders, and paged lists. Folder checks cover a name that looks like a path, a duplicate name, another person’s rename, an empty delete, a folder that still has a file, uploading into a folder, and a second page. Bulk checks cover moving and deleting only your own files, a zip of a shared file, and a folder path that tries to climb out.
+The automated tests cover sign-in, anonymous requests, upload, list, search, sort, download, duplicate names, empty files, Unicode names, Windows device names such as `con.txt`, path-style filenames, HTML forced to download, uploader-only deletion, CSRF, size and storage limits, repeated bad passwords, upload concurrency, a simulated full disk, a storage path that is not a folder, restart, crash cleanup, an aborted upload, a streamed multi-megabyte file, creating a user from the command line, resumable uploads, shared folders, and paged lists. Folder checks cover a name that looks like a path, a duplicate name, another person’s rename, an empty delete, a folder that still has a file, uploading into a folder, and a second page. Bulk checks cover moving and deleting only your own files, a zip of a shared file, and a folder path that tries to climb out. Catalog checks cover a personal favorite, a shared tag that disappears when unused, a collection another person can fill but cannot rename or delete, and a file delete that drops those links. Preview checks cover an image, plain text that contains HTML markup, a refused HTML file, a refused SVG file, a text file with a null byte, a truncated text preview, an image over 8 MB, and a thumbnail queue of eight jobs. Bin checks cover a personal bin, a restore, another person’s refusal, storage that still counts, and removal after 30 days.
 
-The transfer list, folder buttons, list and grid switch, file checkboxes, and folder picker were not clicked in a browser, and they were not tried from a second computer.
+The transfer list, folder buttons, list and grid switch, file checkboxes, folder picker, stars, tag chips, collection controls, preview dialog, and bin were not clicked in a browser, and they were not tried from a second computer.
 
 They do not fill a real disk, and they do not open a second physical computer. Trying the site from another computer on your LAN is a manual check: trust `portal.cer` there, open `https://<this-pc-lan-ip>:8443`, sign in, upload a file, and download it back.
 

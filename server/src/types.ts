@@ -29,4 +29,5 @@ export type FileRecord = {
   folderName: string | null;
   favorite: boolean;
   tags: Array<{ id: string; name: string }>;
+  preview: 'image' | 'text' | 'none';
 };

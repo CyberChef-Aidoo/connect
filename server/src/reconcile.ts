@@ -8,7 +8,7 @@ import {
   setReceivedBytes,
   takeForPublish,
 } from './resume.js';
-import { fileSize, objectPath, tempPath } from './storage.js';
+import { fileSize, objectPath, tempPath, thumbPath } from './storage.js';
 
 export type RecoveryReport = {
   publishedInterrupted: number;
@@ -58,6 +58,7 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
     removeFileRecord(db, staging.id);
     if (finalPath) await rm(finalPath, { force: true });
     if (partial) await rm(partial, { force: true });
+    await discardThumb(storageDir, staging.id);
     report.removedIncomplete += 1;
   }
 
@@ -67,12 +68,14 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
     const size = finalPath ? await fileSize(finalPath) : null;
     if (size === null) {
       removeFileRecord(db, ready.id);
+      await discardThumb(storageDir, ready.id);
       report.removedMissing += 1;
       continue;
     }
     if (size !== ready.sizeBytes) {
       removeFileRecord(db, ready.id);
       if (finalPath) await rm(finalPath, { force: true });
+      await discardThumb(storageDir, ready.id);
       report.removedCorrupt += 1;
     }
   }
@@ -81,6 +84,14 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
   for (const name of await safeList(objectsDir)) {
     if (known.has(name)) continue;
     await rm(path.join(objectsDir, name), { force: true });
+    report.removedOrphans += 1;
+  }
+
+  const thumbsDir = path.join(storageDir, 'thumbs');
+  for (const name of await safeList(thumbsDir)) {
+    const id = name.endsWith('.jpg') ? name.slice(0, -4) : '';
+    if (known.has(id)) continue;
+    await rm(path.join(thumbsDir, name), { force: true });
     report.removedOrphans += 1;
   }
 
@@ -143,6 +154,11 @@ async function repairUploadSessions(
     }
     keptTemps.add(`${session.id}.partial`);
   }
+}
+
+async function discardThumb(storageDir: string, id: string): Promise<void> {
+  const thumb = thumbPath(storageDir, id);
+  if (thumb) await rm(thumb, { force: true });
 }
 
 async function safeList(directory: string): Promise<string[]> {

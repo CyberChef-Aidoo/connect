@@ -14,7 +14,11 @@ import {
   deleteOwnedFile,
   deleteOwnedFiles,
   getReadyFile,
+  listBin,
   listFiles,
+  purgeOwnedBinFile,
+  restoreOwnedFile,
+  takeExpiredBinIds,
   DEFAULT_PAGE_SIZE,
   displayedUsedBytes,
   MAX_PAGE_SIZE,
@@ -51,6 +55,8 @@ import {
   tagExists,
 } from './catalog.js';
 import { formatBytes } from './format.js';
+import { scheduleThumbnail } from './jobs.js';
+import { imageContentType, previewKind, readTextSample, TEXT_PREVIEW_MAX_BYTES } from './preview.js';
 import { hashPassword, passwordProblem, verifyPassword } from './passwords.js';
 import { SqliteSessionStore } from './session-store.js';
 import { UploadSlots } from './slots.js';
@@ -63,6 +69,7 @@ import {
   sanitizeOriginalName,
   syncFile,
   tempPath,
+  thumbPath,
 } from './storage.js';
 import type { Limits } from './types.js';
 import {
@@ -196,7 +203,9 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     });
   });
 
-  app.get('/api/files', requireAuth, (req, res) => {
+  app.get('/api/files', requireAuth, (req, res, next) => {
+    void (async () => {
+    await sweepBin(db, config);
     const query = typeof req.query.q === 'string' ? req.query.q.slice(0, 255) : '';
     const sort = typeof req.query.sort === 'string' ? req.query.sort : 'date';
     const order = typeof req.query.order === 'string' ? req.query.order : 'desc';
@@ -257,6 +266,11 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
       storage: { usedBytes: displayedUsedBytes(db), limitBytes: config.maxStorageBytes },
       limits,
     });
+    })().catch(next);
+  });
+
+  app.get('/api/bin', requireAuth, (req, res, next) => {
+    void handleBin(req, res, db, config).catch(next);
   });
 
   app.post('/api/folders', requireAuth, requireCsrf, (req, res) => {
@@ -481,8 +495,34 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     void handleZip(req, res, db, config).catch(next);
   });
 
+  app.get('/api/files/:id/preview', requireAuth, (req, res, next) => {
+    void handlePreview(req, res, db, config).catch(next);
+  });
+
+  app.get('/api/files/:id/thumbnail', requireAuth, (req, res, next) => {
+    void handleThumbnail(req, res, db, config).catch(next);
+  });
+
   app.get('/api/files/:id/download', requireAuth, (req, res, next) => {
     void handleDownload(req, res, db, config).catch(next);
+  });
+
+  app.post('/api/files/:id/restore', requireAuth, requireCsrf, (req, res) => {
+    const restored = restoreOwnedFile(db, routeId(req), req.session.userId!);
+    if (restored === 'missing') {
+      res.status(404).json({ error: 'That file is not in the bin.' });
+      return;
+    }
+    if (restored === 'forbidden') {
+      res.status(403).json({ error: 'You can restore only files you uploaded.' });
+      return;
+    }
+    const file = getReadyFile(db, routeId(req), req.session.userId!);
+    res.json({ file });
+  });
+
+  app.delete('/api/files/:id/permanent', requireAuth, requireCsrf, (req, res, next) => {
+    void handlePermanentDelete(req, res, db, config).catch(next);
   });
 
   app.delete('/api/files/:id', requireAuth, requireCsrf, (req, res, next) => {
@@ -628,6 +668,7 @@ async function handleCreateUpload(
   res: Response,
   ctx: { db: DatabaseSync; config: AppConfig },
 ): Promise<void> {
+  await sweepBin(ctx.db, ctx.config);
   const userId = req.session.userId!;
   const request = readUploadStart(req.body);
   if (!request) {
@@ -944,6 +985,7 @@ async function publishStagedTemp(
   }
   const file = getReadyFile(db, id, userId);
   if (!file) return { ok: false, status: 500, error: 'The upload could not be saved.' };
+  scheduleThumbnail(config.storageDir, file);
   return { ok: true, file };
 }
 
@@ -1043,6 +1085,7 @@ async function handleUpload(
   res: Response,
   ctx: { db: DatabaseSync; config: AppConfig; slots: UploadSlots; openTemp?: TempWriter },
 ): Promise<void> {
+  await sweepBin(ctx.db, ctx.config);
   const userId = req.session.userId!;
   const headerFolder = req.get('x-folder-id');
   const folder = resolveFolder(ctx.db, headerFolder ? headerFolder : null);
@@ -1172,6 +1215,7 @@ async function handleUpload(
     }
 
     const file = getReadyFile(ctx.db, id, userId);
+    if (file) scheduleThumbnail(ctx.config.storageDir, file);
     res.status(201).json({ file });
   } catch (error) {
     await discardTemp(partial);
@@ -1184,6 +1228,101 @@ async function handleUpload(
   } finally {
     release();
   }
+}
+
+async function handlePreview(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const located = await locateReadyFile(req, res, db, config);
+  if (!located) return;
+  const kind = previewKind(located.record.originalName, located.record.sizeBytes);
+  if (kind === 'none') {
+    res.status(415).json({ error: 'This file cannot be previewed. Download it instead.' });
+    return;
+  }
+  if (kind === 'text') {
+    const sample = await readTextSample(located.finalPath, located.size, TEXT_PREVIEW_MAX_BYTES);
+    if (sample === 'binary') {
+      res.status(415).json({ error: 'This file cannot be previewed. Download it instead.' });
+      return;
+    }
+    const body = Buffer.from(sample.text, 'utf8');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Length', String(body.length));
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Preview-Truncated', sample.truncated ? '1' : '0');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.end(body);
+    return;
+  }
+  const contentType = imageContentType(located.record.originalName);
+  if (!contentType) {
+    res.status(415).json({ error: 'This file cannot be previewed. Download it instead.' });
+    return;
+  }
+  await sendInlineFile(req, res, located.finalPath, located.size, contentType);
+}
+
+async function handleThumbnail(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const located = await locateReadyFile(req, res, db, config);
+  if (!located) return;
+  const generated = thumbPath(config.storageDir, located.record.id);
+  const generatedSize = generated ? await fileSize(generated) : null;
+  if (generated && generatedSize) {
+    await sendInlineFile(req, res, generated, generatedSize, 'image/jpeg');
+    return;
+  }
+  if (previewKind(located.record.originalName, located.record.sizeBytes) !== 'image') {
+    res.status(404).json({ error: 'This file has no thumbnail.' });
+    return;
+  }
+  const contentType = imageContentType(located.record.originalName);
+  if (!contentType) {
+    res.status(404).json({ error: 'This file has no thumbnail.' });
+    return;
+  }
+  await sendInlineFile(req, res, located.finalPath, located.size, contentType);
+}
+
+async function locateReadyFile(
+  req: Request,
+  res: Response,
+  db: DatabaseSync,
+  config: AppConfig,
+): Promise<{ record: NonNullable<ReturnType<typeof getReadyFile>>; finalPath: string; size: number } | null> {
+  const record = getReadyFile(db, req.params.id, req.session.userId!);
+  if (!record) {
+    res.status(404).json({ error: 'That file is not in the portal.' });
+    return null;
+  }
+  const finalPath = objectPath(config.storageDir, record.id);
+  const size = finalPath ? await fileSize(finalPath) : null;
+  if (!finalPath || size !== record.sizeBytes) {
+    res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+    return null;
+  }
+  return { record, finalPath, size };
+}
+
+async function sendInlineFile(req: Request, res: Response, filePath: string, size: number, contentType: string): Promise<void> {
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Length', String(size));
+  res.setHeader('Content-Disposition', 'inline');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  const stream = createReadStream(filePath);
+  stream.on('error', (error) => {
+    console.error(`storage read failed (${'code' in error ? String(error.code) : 'unknown'})`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+    } else {
+      res.destroy();
+    }
+  });
+  await pipeline(stream, res).catch(() => undefined);
 }
 
 async function handleDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
@@ -1224,6 +1363,50 @@ async function handleDownload(req: Request, res: Response, db: DatabaseSync, con
   });
 }
 
+async function handleBin(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  await sweepBin(db, config);
+  res.json({
+    files: listBin(db, req.session.userId!),
+    retentionDays: 30,
+    storage: { usedBytes: displayedUsedBytes(db), limitBytes: config.maxStorageBytes },
+  });
+}
+
+async function handlePermanentDelete(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const id = routeId(req);
+  const result = purgeOwnedBinFile(db, id, req.session.userId!);
+  if (result === 'missing') {
+    res.status(404).json({ error: 'That file is not in the bin.' });
+    return;
+  }
+  if (result === 'forbidden') {
+    res.status(403).json({ error: 'You can remove only files you uploaded.' });
+    return;
+  }
+  await discardStoredFile(config, id);
+  removeUnusedTags(db);
+  res.json({ ok: true });
+}
+
+async function sweepBin(db: DatabaseSync, config: AppConfig): Promise<void> {
+  const ids = takeExpiredBinIds(db);
+  for (const id of ids) await discardStoredFile(config, id);
+  if (ids.length > 0) removeUnusedTags(db);
+}
+
+async function discardStoredFile(config: AppConfig, id: string): Promise<void> {
+  const finalPath = objectPath(config.storageDir, id);
+  if (finalPath) {
+    try {
+      await rm(finalPath, { force: true });
+    } catch (error) {
+      console.error(`stored file remained after delete (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
+    }
+  }
+  const thumb = thumbPath(config.storageDir, id);
+  if (thumb) await rm(thumb, { force: true });
+}
+
 async function handleDeleteMany(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
   const ids = readIds(req.body?.ids);
   if (!ids) {
@@ -1231,16 +1414,6 @@ async function handleDeleteMany(req: Request, res: Response, db: DatabaseSync, c
     return;
   }
   const result = deleteOwnedFiles(db, req.session.userId!, ids);
-  for (const id of result.deleted) {
-    const finalPath = objectPath(config.storageDir, id);
-    if (!finalPath) continue;
-    try {
-      await rm(finalPath, { force: true });
-    } catch (error) {
-      console.error(`stored file remained after delete (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
-    }
-  }
-  removeUnusedTags(db);
   res.json(result);
 }
 
@@ -1304,14 +1477,5 @@ async function handleDelete(req: Request, res: Response, db: DatabaseSync, confi
     res.status(403).json({ error: 'You can delete only files you uploaded.' });
     return;
   }
-  const finalPath = objectPath(config.storageDir, id);
-  if (finalPath) {
-    try {
-      await rm(finalPath, { force: true });
-    } catch (error) {
-      console.error(`stored file remained after delete (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
-    }
-  }
-  removeUnusedTags(db);
   res.json({ ok: true });
 }

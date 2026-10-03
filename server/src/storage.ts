@@ -6,8 +6,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export async function ensureStorage(storageDir: string): Promise<void> {
   const objects = path.join(storageDir, 'objects');
   const tmp = path.join(storageDir, 'tmp');
+  const thumbs = path.join(storageDir, 'thumbs');
   await mkdir(objects, { recursive: true });
   await mkdir(tmp, { recursive: true });
+  await mkdir(thumbs, { recursive: true });
   const probe = path.join(tmp, '.write-probe');
   try {
     await writeFile(probe, 'ok', { flag: 'w' });
@@ -29,6 +31,11 @@ export function objectPath(storageDir: string, id: string): string | null {
 export function tempPath(storageDir: string, id: string): string | null {
   if (!UUID_RE.test(id)) return null;
   return containedPath(path.resolve(storageDir, 'tmp'), `${id}.partial`);
+}
+
+export function thumbPath(storageDir: string, id: string): string | null {
+  if (!UUID_RE.test(id)) return null;
+  return containedPath(path.resolve(storageDir, 'thumbs'), `${id}.jpg`);
 }
 
 export async function syncFile(filePath: string): Promise<void> {

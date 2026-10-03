@@ -12,6 +12,7 @@ import {
   detachTag,
   ensureFolder,
   getSession,
+  listBin,
   listCollections,
   listFiles,
   listTags,
@@ -19,13 +20,16 @@ import {
   login,
   logout,
   moveFiles,
+  purgeFile,
   removeFromCollection,
   renameCollection,
   renameFolder,
+  restoreFile,
   setFavorite,
   tagFiles,
   uploadFile,
   zipUrl,
+  type BinFile,
   type Breadcrumb,
   type CollectionItem,
   type FileList,
@@ -219,6 +223,10 @@ function Dashboard({
   const [collectionDraft, setCollectionDraft] = useState('');
   const [bulkCollectionId, setBulkCollectionId] = useState('');
   const [collectionName, setCollectionName] = useState('');
+  const [previewing, setPreviewing] = useState<PortalFile | null>(null);
+  const [binOpen, setBinOpen] = useState(false);
+  const [binFiles, setBinFiles] = useState<BinFile[]>([]);
+  const [binDays, setBinDays] = useState(30);
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
   const started = useRef(new Set<string>());
   const controllers = useRef(new Map<string, AbortController>());
@@ -323,6 +331,27 @@ function Dashboard({
     }
     await loadPending();
   }
+
+  async function loadBin() {
+    try {
+      const next = await listBin();
+      setBinFiles(next.files);
+      setBinDays(next.retentionDays);
+      setListError('');
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.status === 401) {
+        onSession(null);
+        return;
+      }
+      setListError(caught instanceof ApiError ? caught.message : 'The bin could not be loaded.');
+    }
+  }
+
+  useEffect(() => {
+    if (!binOpen) return;
+    void loadBin();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [binOpen, csrf]);
 
   useEffect(() => {
     void refresh();
@@ -665,8 +694,8 @@ function Dashboard({
       setConfirmBulkDelete(false);
       const left = result.skipped.length;
       setBanner(left > 0
-        ? `Deleted ${result.deleted.length}. Left ${left} that you did not upload.`
-        : `Deleted ${result.deleted.length}.`);
+        ? `Moved ${result.deleted.length} to the bin. Left ${left} that you did not upload.`
+        : `Moved ${result.deleted.length} to the bin.`);
       await refresh();
     } catch (caught) {
       setListError(caught instanceof ApiError ? caught.message : 'The files could not be deleted.');
@@ -840,7 +869,7 @@ function Dashboard({
             <button type="button" onClick={() => void moveSelected()}>Move to this folder</button>
             {confirmBulkDelete ? (
               <>
-                <span>Delete the files you uploaded?</span>
+                <span>Move the files you uploaded to the bin?</span>
                 <button type="button" className="danger" onClick={() => void deleteSelected()}>Delete</button>
                 <button type="button" className="ghost" onClick={() => setConfirmBulkDelete(false)}>Keep</button>
               </>
@@ -882,6 +911,7 @@ function Dashboard({
             </select>
           </label>
           <button type="button" className="ghost" aria-pressed={favoriteOnly} onClick={() => chooseFavorite(!favoriteOnly)}>Favorites</button>
+          <button type="button" className="ghost" aria-pressed={binOpen} onClick={() => setBinOpen((open) => !open)}>Bin</button>
           <label>
             Tag
             <select value={tagId} onChange={(event) => chooseTag(event.target.value)}>
@@ -923,6 +953,19 @@ function Dashboard({
         <datalist id="portal-tags">
           {tags.map((tag) => <option key={tag.id} value={tag.name} />)}
         </datalist>
+        {binOpen ? (
+          <BinPanel
+            files={binFiles}
+            retentionDays={binDays}
+            csrfToken={csrf}
+            onChanged={async () => {
+              await loadBin();
+              await refresh();
+            }}
+            onError={setListError}
+          />
+        ) : (
+          <>
         <FolderList
           folders={search || favoriteOnly || tagId || collectionId ? [] : (listing?.folders ?? [])}
           csrfToken={csrf}
@@ -942,6 +985,7 @@ function Dashboard({
             csrfToken={csrf}
             onChanged={refresh}
             onError={setListError}
+            onPreview={setPreviewing}
           />
         ) : (
           <FileTable
@@ -956,12 +1000,16 @@ function Dashboard({
             csrfToken={csrf}
             onChanged={refresh}
             onError={setListError}
+            onPreview={setPreviewing}
           />
         )}
+        <PreviewDialog file={previewing} onClose={() => setPreviewing(null)} />
         <div className="pager">
           <button type="button" className="ghost" disabled={cursorStack.length === 0} onClick={showPrevious}>Previous</button>
           <button type="button" className="ghost" disabled={!listing?.page?.nextCursor} onClick={showNext}>Next</button>
         </div>
+          </>
+        )}
       </section>
     </div>
   );
@@ -1327,6 +1375,7 @@ function FileTable({
   csrfToken,
   onChanged,
   onError,
+  onPreview,
 }: {
   files: PortalFile[];
   loading: boolean;
@@ -1339,6 +1388,7 @@ function FileTable({
   csrfToken: string;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
+  onPreview: (file: PortalFile) => void;
 }) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -1412,6 +1462,9 @@ function FileTable({
                 />
               </td>
               <td className="filename">
+                {file.preview === 'image' ? (
+                  <img className="thumb" alt="" src={`/api/files/${encodeURIComponent(file.id)}/thumbnail`} />
+                ) : null}
                 {file.originalName}
                 {searching && file.folderName ? <span className="meta"> In {file.folderName}</span> : null}
               </td>
@@ -1419,15 +1472,18 @@ function FileTable({
               <td>{formatWhen(file.createdAt)}</td>
               <td>{file.ownerUsername}</td>
               <td className="actions">
+                {file.preview === 'image' || file.preview === 'text' ? (
+                  <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
+                ) : null}
                 <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
                 {file.canDelete && pendingDelete !== file.id ? (
                   <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
                 ) : null}
                 {file.canDelete && pendingDelete === file.id ? (
                   <>
-                    <span>Delete this file?</span>
+                    <span>Move this file to the bin?</span>
                     <button type="button" className="danger" disabled={deleting === file.id} onClick={() => void confirmDelete(file)}>
-                      {deleting === file.id ? 'Deleting…' : 'Delete'}
+                      {deleting === file.id ? 'Moving…' : 'Move to bin'}
                     </button>
                     <button type="button" className="ghost" onClick={() => setPendingDelete(null)}>Keep</button>
                   </>
@@ -1452,6 +1508,7 @@ function FileGrid({
   csrfToken,
   onChanged,
   onError,
+  onPreview,
 }: {
   files: PortalFile[];
   loading: boolean;
@@ -1463,6 +1520,7 @@ function FileGrid({
   csrfToken: string;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
+  onPreview: (file: PortalFile) => void;
 }) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -1507,23 +1565,271 @@ function FileGrid({
             onChanged={onChanged}
             onError={onError}
           />
+          {file.preview === 'image' ? (
+            <img className="thumb" alt="" src={`/api/files/${encodeURIComponent(file.id)}/thumbnail`} />
+          ) : null}
           <strong className="filename">{file.originalName}</strong>
           <span className="meta">{formatBytes(file.sizeBytes)} · {file.ownerUsername}</span>
           {searching && file.folderName ? <span className="meta">In {file.folderName}</span> : null}
           <span className="meta">{formatWhen(file.createdAt)}</span>
           <div className="actions">
+            {file.preview === 'image' || file.preview === 'text' ? (
+              <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
+            ) : null}
             <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
             {file.canDelete && pendingDelete !== file.id ? (
               <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
             ) : null}
             {file.canDelete && pendingDelete === file.id ? (
               <button type="button" className="danger" disabled={deleting === file.id} onClick={() => void confirmDelete(file)}>
-                {deleting === file.id ? 'Deleting…' : 'Delete'}
+                {deleting === file.id ? 'Moving…' : 'Move to bin'}
               </button>
             ) : null}
           </div>
         </li>
       ))}
     </ul>
+  );
+}
+
+function FileMarks({
+  file,
+  collectionId,
+  csrfToken,
+  onChanged,
+  onError,
+}: {
+  file: PortalFile;
+  collectionId: string;
+  csrfToken: string;
+  onChanged: () => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [draft, setDraft] = useState('');
+
+  async function star() {
+    onError('');
+    try {
+      await setFavorite(file.id, !file.favorite, csrfToken);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The favorite could not be saved.');
+    }
+  }
+
+  async function addTag(event: FormEvent) {
+    event.preventDefault();
+    if (!draft.trim()) return;
+    onError('');
+    try {
+      await tagFiles([file.id], draft, csrfToken);
+      setDraft('');
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The tag could not be saved.');
+    }
+  }
+
+  async function removeTag(id: string) {
+    onError('');
+    try {
+      await detachTag(file.id, id, csrfToken);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The tag could not be removed.');
+    }
+  }
+
+  async function leaveCollection() {
+    if (!collectionId) return;
+    onError('');
+    try {
+      await removeFromCollection(collectionId, file.id, csrfToken);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The file could not be removed from the collection.');
+    }
+  }
+
+  return (
+    <div className="marks">
+      <button
+        type="button"
+        className="ghost star"
+        aria-pressed={Boolean(file.favorite)}
+        aria-label={file.favorite ? `Remove ${file.originalName} from favorites` : `Add ${file.originalName} to favorites`}
+        onClick={() => void star()}
+      >
+        {file.favorite ? '★' : '☆'}
+      </button>
+      {(file.tags ?? []).map((tag) => (
+        <span key={tag.id} className="chip">
+          {tag.name}
+          <button type="button" className="ghost" aria-label={`Remove tag ${tag.name} from ${file.originalName}`} onClick={() => void removeTag(tag.id)}>×</button>
+        </span>
+      ))}
+      <form className="inline-rename" onSubmit={(event) => void addTag(event)}>
+        <label className="sr" htmlFor={`tag-${file.id}`}>Tag for {file.originalName}</label>
+        <input id={`tag-${file.id}`} list="portal-tags" value={draft} placeholder="Add tag" onChange={(event) => setDraft(event.target.value)} />
+      </form>
+      {collectionId ? (
+        <button type="button" className="ghost" onClick={() => void leaveCollection()}>Remove from collection</button>
+      ) : null}
+    </div>
+  );
+}
+
+function BinPanel({
+  files,
+  retentionDays,
+  csrfToken,
+  onChanged,
+  onError,
+}: {
+  files: BinFile[];
+  retentionDays: number;
+  csrfToken: string;
+  onChanged: () => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [pending, setPending] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function restore(file: BinFile) {
+    setBusy(file.id);
+    onError('');
+    try {
+      await restoreFile(file.id, csrfToken);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The file could not be restored.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function purge(file: BinFile) {
+    setBusy(file.id);
+    onError('');
+    try {
+      await purgeFile(file.id, csrfToken);
+      setPending(null);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The file could not be removed.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="bin">
+      <p className="meta">
+        Only you can see files you deleted. They stay for {retentionDays} days, still count toward the storage limit, and then are removed.
+      </p>
+      {files.length === 0 ? <p className="status">The bin is empty.</p> : (
+        <ul className="folders">
+          {files.map((file) => (
+            <li key={file.id}>
+              <span className="filename">{file.originalName}</span>
+              <span className="meta">{formatBytes(file.sizeBytes)} · {formatWhen(file.deletedAt)}</span>
+              <button type="button" disabled={busy === file.id} onClick={() => void restore(file)}>Restore</button>
+              {pending !== file.id ? (
+                <button type="button" className="ghost danger" onClick={() => setPending(file.id)}>Delete permanently</button>
+              ) : (
+                <>
+                  <span>Remove this file from the portal?</span>
+                  <button type="button" className="danger" disabled={busy === file.id} onClick={() => void purge(file)}>Delete</button>
+                  <button type="button" className="ghost" onClick={() => setPending(null)}>Keep</button>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function PreviewDialog({
+  file,
+  onClose,
+}: {
+  file: PortalFile | null;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [text, setText] = useState('');
+  const [truncated, setTruncated] = useState(false);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (file && !dialog.open) dialog.showModal();
+    if (!file && dialog.open) dialog.close();
+  }, [file]);
+
+  useEffect(() => {
+    if (!file || file.preview !== 'text') return undefined;
+    const controller = new AbortController();
+    setLoading(true);
+    setError('');
+    setText('');
+    setTruncated(false);
+    void fetch(`/api/files/${encodeURIComponent(file.id)}/preview`, {
+      credentials: 'same-origin',
+      signal: controller.signal,
+    }).then(async (response) => {
+      const body = await response.text();
+      if (!response.ok) {
+        let message = 'This file cannot be previewed. Download it instead.';
+        try {
+          const parsed = JSON.parse(body) as { error?: unknown };
+          if (typeof parsed.error === 'string' && parsed.error.trim()) message = parsed.error;
+        } catch {
+          // The body was not JSON.
+        }
+        throw new Error(message);
+      }
+      if (!response.headers.get('content-type')?.startsWith('text/plain')) {
+        throw new Error('This file cannot be previewed. Download it instead.');
+      }
+      setTruncated(response.headers.get('x-preview-truncated') === '1');
+      setText(body);
+    }).catch((caught: unknown) => {
+      if (controller.signal.aborted) return;
+      setError(caught instanceof Error ? caught.message : 'This file cannot be previewed. Download it instead.');
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoading(false);
+    });
+    return () => controller.abort();
+  }, [file]);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="preview"
+      aria-labelledby="preview-title"
+      onClose={onClose}
+    >
+      {file ? (
+        <>
+          <h2 id="preview-title">{file.originalName}</h2>
+          {file.preview === 'image' ? (
+            <img alt={file.originalName} src={`/api/files/${encodeURIComponent(file.id)}/preview`} />
+          ) : null}
+          {file.preview === 'text' && loading ? <p className="status" role="status">Loading preview…</p> : null}
+          {file.preview === 'text' && error ? <p className="banner error" role="alert">{error}</p> : null}
+          {file.preview === 'text' && !error ? <pre>{text}</pre> : null}
+          {truncated ? <p className="meta">Showing the first 256 KB. Download the file for the rest.</p> : null}
+          <div className="actions">
+            <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
+            <button type="button" className="ghost" onClick={onClose}>Close</button>
+          </div>
+        </>
+      ) : null}
+    </dialog>
   );
 }

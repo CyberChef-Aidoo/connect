@@ -49,6 +49,7 @@ export function openDatabase(databasePath: string): DatabaseSync {
   `);
   migrateFolders(db);
   migrateCatalog(db);
+  migrateBin(db);
   return db;
 }
 
@@ -120,6 +121,11 @@ function migrateCatalog(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_collection_files_file ON collection_files(file_id);
   `);
+}
+
+function migrateBin(db: DatabaseSync): void {
+  ensureColumn(db, 'files', 'deleted_at', 'ALTER TABLE files ADD COLUMN deleted_at TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(owner_id, deleted_at)');
 }
 
 function ensureColumn(db: DatabaseSync, table: string, column: string, statement: string): void {

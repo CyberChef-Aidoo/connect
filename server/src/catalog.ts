@@ -211,7 +211,7 @@ export function attachCatalog<T extends { id: string; favorite: boolean; tags: T
 
 function readyFile(db: DatabaseSync, id: string): boolean {
   if (!UUID_RE.test(id)) return false;
-  return Boolean(db.prepare("SELECT id FROM files WHERE id = ? AND state = 'ready'").get(id));
+  return Boolean(db.prepare("SELECT id FROM files WHERE id = ? AND state = 'ready' AND deleted_at IS NULL").get(id));
 }
 
 function collectionOwner(db: DatabaseSync, id: string): string | undefined {

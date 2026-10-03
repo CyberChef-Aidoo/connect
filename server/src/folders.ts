@@ -137,9 +137,12 @@ export function deleteFolder(
     if (!existing) return { ok: false, reason: 'missing' };
     if (existing.created_by !== userId) return { ok: false, reason: 'forbidden' };
     const children = db.prepare('SELECT COUNT(*) AS n FROM folders WHERE parent_id = ?').get(id) as { n: unknown };
-    const files = db.prepare('SELECT COUNT(*) AS n FROM files WHERE folder_id = ?').get(id) as { n: unknown };
+    const files = db.prepare(
+      'SELECT COUNT(*) AS n FROM files WHERE folder_id = ? AND deleted_at IS NULL',
+    ).get(id) as { n: unknown };
     const uploads = db.prepare('SELECT COUNT(*) AS n FROM upload_sessions WHERE folder_id = ?').get(id) as { n: unknown };
     if (count(children.n) + count(files.n) + count(uploads.n) > 0) return { ok: false, reason: 'not-empty' };
+    db.prepare('UPDATE files SET folder_id = NULL WHERE folder_id = ? AND deleted_at IS NOT NULL').run(id);
     const result = db.prepare('DELETE FROM folders WHERE id = ? AND created_by = ?').run(id, userId);
     return result.changes === 1 ? { ok: true } : { ok: false, reason: 'missing' };
   });

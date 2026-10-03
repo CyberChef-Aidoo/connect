@@ -29,6 +29,7 @@ export type PortalFile = {
   folderName?: string | null;
   favorite?: boolean;
   tags?: TagItem[];
+  preview?: 'image' | 'text' | 'none';
 };
 
 export type TagItem = { id: string; name: string };
@@ -207,6 +208,31 @@ export async function deleteFiles(
 
 export function zipUrl(ids: string[]): string {
   return `/api/files/zip?ids=${ids.map((id) => encodeURIComponent(id)).join(',')}`;
+}
+
+export type BinFile = PortalFile & { deletedAt: string };
+
+export async function listBin(): Promise<{ files: BinFile[]; retentionDays: number }> {
+  const response = await fetch('/api/bin', { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function restoreFile(id: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/files/${encodeURIComponent(id)}/restore`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function purgeFile(id: string, csrfToken: string): Promise<void> {
+  const response = await fetch(`/api/files/${encodeURIComponent(id)}/permanent`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
 }
 
 export async function deleteFile(id: string, csrfToken: string): Promise<void> {
