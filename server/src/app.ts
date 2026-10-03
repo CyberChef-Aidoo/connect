@@ -91,7 +91,7 @@ import {
   unlockSession,
   writeChunk,
 } from './resume.js';
-import { findUserById, findUserByUsername } from './users.js';
+import { createUser, findUserById, findUserByUsername } from './users.js';
 import { discardTemp, receiveUpload, type TempWriter } from './uploads.js';
 
 export type AppOptions = {
@@ -168,13 +168,22 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     message: { error: 'Too many sign-in attempts. Wait and try again.' },
   });
 
-  app.get('/api/auth/me', (req, res) => {
-    const user = currentUser(db, req);
-    if (!user) {
-      res.status(401).json({ error: 'Sign in required.' });
-      return;
-    }
-    res.json(sessionBody(user, req.session.csrfToken ?? '', config));
+  app.get('/api/auth/me', (req, res, next) => {
+    void (async () => {
+      let user = currentUser(db, req);
+      if (!user && config.openAccess) {
+        user = await ensureOpenUser(db, passwordCost);
+        await regenerateSession(req);
+        req.session.userId = user.id;
+        req.session.csrfToken = randomBytes(32).toString('base64url');
+        await saveSession(req);
+      }
+      if (!user) {
+        res.status(401).json({ error: 'Sign in required.' });
+        return;
+      }
+      res.json(sessionBody(user, req.session.csrfToken ?? '', config));
+    })().catch(next);
   });
 
   app.post('/api/auth/login', loginLimiter, (req, res, next) => {
@@ -668,7 +677,20 @@ function sessionBody(user: { id: string; username: string }, csrfToken: string, 
       maxPerUser: config.maxUploadsPerUser,
       maxGlobal: config.maxUploadsGlobal,
     },
+    openAccess: config.openAccess,
   };
+}
+
+async function ensureOpenUser(db: DatabaseSync, cost: number) {
+  const existing = findUserByUsername(db, 'local');
+  if (existing) return existing;
+  try {
+    return await createUser(db, 'local', randomBytes(32).toString('base64url'), cost);
+  } catch (error) {
+    const again = findUserByUsername(db, 'local');
+    if (again) return again;
+    throw error;
+  }
 }
 
 function currentUser(db: DatabaseSync, req: Request) {

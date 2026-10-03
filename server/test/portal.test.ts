@@ -40,6 +40,7 @@ function testConfig(dir: string, overrides: Partial<AppConfig> = {}): AppConfig 
     maxUploadsPerUser: 3,
     maxUploadsGlobal: 8,
     usingDevSessionSecret: false,
+    openAccess: false,
     ...overrides,
   };
 }
@@ -1350,6 +1351,30 @@ describe('portal', () => {
         payload: '',
       });
       assert.equal(missing.status, 404);
+    });
+  });
+
+  it('opens the file list without a password when open access is on', async () => {
+    await withPortal({ openAccess: true }, async (handle) => {
+      const locked = await request(handle.app).get('/api/files');
+      assert.equal(locked.status, 401);
+
+      const agent = request.agent(handle.app);
+      const me = await agent.get('/api/auth/me');
+      assert.equal(me.status, 200);
+      assert.equal(me.body.user.username, 'local');
+      assert.equal(me.body.openAccess, true);
+      assert.equal(me.body.password, undefined);
+      assert.equal(JSON.stringify(me.body).includes('password'), false);
+
+      const files = await agent.get('/api/files');
+      assert.equal(files.status, 200);
+      const uploaded = await uploadNamed(agent, me.body.csrfToken as string, 'notes.txt', 'hello');
+      assert.equal(uploaded.status, 201);
+      assert.equal(uploaded.body.file.canDelete, true);
+
+      const again = await agent.get('/api/auth/me');
+      assert.equal(again.body.user.id, me.body.user.id);
     });
   });
 });

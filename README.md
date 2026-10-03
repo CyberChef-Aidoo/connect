@@ -2,7 +2,7 @@
 
 A small website that runs on one Windows computer and stores the files on that computer. Other computers on the same local network open it in a browser. Nothing is uploaded to a cloud service, and the portal does not need an internet connection after it is installed.
 
-People sign in with their own username and password. Anyone who is signed in can browse, search, and download every shared file. Only the person who uploaded a file can delete it.
+With `OPEN_ACCESS=1` in `.env`, the site opens without a username or password. Anyone who can reach it can browse, upload, and download. Files uploaded in that mode belong to one shared account, so anyone can delete those. Set `OPEN_ACCESS` empty to require a username and password again. Only the person who uploaded a file can delete it.
 
 Each file can be up to **2 GB**. The portal holds up to **50 GB** in total. Both limits are set in `.env`.
 
@@ -234,7 +234,7 @@ npm run create-user -- username
 
 ## Using the website
 
-1. Sign in.
+1. Open the site. With `OPEN_ACCESS=1`, the file list appears immediately. With that line empty, sign in with an account created on this PC.
 2. Drop files onto the page, choose files, or choose a folder when the browser offers that. A folder from your computer is recreated under the folder you have open. If the browser cannot pick a folder, choose the files instead. A path that tries to climb out with `..` stays inside the open folder. The transfer list shows waiting, active, finished, canceled, and failed files. An active file shows how much has been sent, the recent speed, and an estimate of the time left. If the transfer stops making progress, the row says it is stalled. Cancel removes that upload, including any part already saved. Retry continues from the last saved part when the upload is still on the server. You can run 1, 2, or 3 uploads at once; the server still enforces its own cap. Leaving or reloading the page stops the browser’s current transfer. Choose the same file again to continue. Saved progress stays for 24 hours. The page cannot resume a file by itself after a reload.
 3. Create a folder and open it from the breadcrumb trail. A new upload goes into the folder you have open. Anyone signed in can open every folder. Only the person who created a folder can rename it, and can delete it when it is empty. Search still looks through every folder. Sort by name, size, or date. Switch between the list and the grid. The file list is loaded one page at a time.
 4. Select files to move them into the open folder, delete them, download them as one zip, tag them, or add them to a collection. Move and delete apply only to files you uploaded. A zip can include any selected file, because anyone signed in can already download it. Up to 100 files at a time. A single download still uses the browser’s own download, and the page does not show download progress.

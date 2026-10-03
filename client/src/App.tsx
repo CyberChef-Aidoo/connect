@@ -882,9 +882,11 @@ function Dashboard({
           <h1>Shared files</h1>
         </div>
         <div className="who">
-          <span>{session.user.username}</span>
+          {session.openAccess ? null : <span>{session.user.username}</span>}
           <ThemeButton theme={theme} />
-          <button type="button" className="ghost" onClick={() => void signOut()}>Sign out</button>
+          {session.openAccess ? null : (
+            <button type="button" className="ghost" onClick={() => void signOut()}>Sign out</button>
+          )}
         </div>
       </header>
 

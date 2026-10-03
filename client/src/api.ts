@@ -15,6 +15,7 @@ export type Session = {
   csrfToken: string;
   limits: Limits;
   uploads: UploadCaps;
+  openAccess?: boolean;
 };
 
 export type PortalFile = {

@@ -25,6 +25,7 @@ export type AppConfig = {
   maxUploadsPerUser: number;
   maxUploadsGlobal: number;
   usingDevSessionSecret: boolean;
+  openAccess: boolean;
 };
 
 export function repoRootFromHere(metaUrl: string): string {
@@ -90,6 +91,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv, repoRoot: string): AppConf
     maxUploadsPerUser: 3,
     maxUploadsGlobal: 8,
     usingDevSessionSecret,
+    openAccess: readFlag(env, 'OPEN_ACCESS'),
   };
 }
 
@@ -161,6 +163,11 @@ function readRequiredFile(filePath: string, label: string): Buffer {
     throw new Error(`${label} does not exist: ${filePath}`);
   }
   return readFileSync(filePath);
+}
+
+function readFlag(env: NodeJS.ProcessEnv, key: string): boolean {
+  const value = readString(env, key).toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
 }
 
 function readString(env: NodeJS.ProcessEnv, key: string): string {
