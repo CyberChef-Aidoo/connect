@@ -33,6 +33,15 @@ export type PortalFile = {
   versionCount?: number;
 };
 
+export type DirectSignal = {
+  transferId: string;
+  fromUserId: string;
+  toUserId: string;
+  fileId: string;
+  kind: 'request' | 'offer' | 'answer' | 'ice' | 'reject';
+  payload: string;
+};
+
 export type FileVersion = {
   id: string;
   originalName: string;
@@ -113,6 +122,41 @@ export async function login(username: string, password: string): Promise<Session
     body: JSON.stringify({ username, password }),
   });
   return normalizeSession(await readJson<Session>(response));
+}
+
+export async function heartbeat(csrfToken: string): Promise<void> {
+  const response = await fetch('/api/peers/heartbeat', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  await readJson(response);
+}
+
+export async function listPeers(): Promise<{ online: string[] }> {
+  const response = await fetch('/api/peers', { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function takeSignals(): Promise<{ signals: DirectSignal[] }> {
+  const response = await fetch('/api/signals', { credentials: 'same-origin' });
+  return readJson(response);
+}
+
+export async function postSignal(body: {
+  fileId: string;
+  toUserId: string;
+  kind: DirectSignal['kind'];
+  transferId?: string;
+  payload: string;
+}, csrfToken: string): Promise<{ transferId: string }> {
+  const response = await fetch('/api/signals', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify(body),
+  });
+  return readJson(response);
 }
 
 export async function logout(csrfToken: string): Promise<void> {

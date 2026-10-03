@@ -1245,6 +1245,113 @@ describe('portal', () => {
       await removeDir(dir);
     }
   });
+
+  it('passes a direct-send signal only between the uploader and the receiver', async () => {
+    await withPortal({}, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const blake = await account(handle, 'blake');
+      const uploaded = await uploadNamed(ada.agent, ada.csrf, 'notes.txt', 'hello');
+      assert.equal(uploaded.status, 201);
+      const fileId = uploaded.body.file.id as string;
+
+      const anonymous = await request(handle.app).post('/api/peers/heartbeat');
+      assert.equal(anonymous.status, 401);
+      const missingToken = await blake.agent.post('/api/peers/heartbeat');
+      assert.equal(missingToken.status, 403);
+
+      const beat = await ada.agent.post('/api/peers/heartbeat').set('X-CSRF-Token', ada.csrf);
+      assert.equal(beat.status, 200);
+      const people = await blake.agent.get('/api/peers');
+      assert.equal(people.status, 200);
+      assert.deepEqual(people.body.online, [ada.userId]);
+
+      const wrongPerson = await ada.agent.post('/api/signals').set('X-CSRF-Token', ada.csrf).send({
+        fileId,
+        toUserId: blake.userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(wrongPerson.status, 403);
+
+      const blakeFile = await uploadNamed(blake.agent, blake.csrf, 'other.txt', 'there');
+      const offline = await ada.agent.post('/api/signals').set('X-CSRF-Token', ada.csrf).send({
+        fileId: blakeFile.body.file.id,
+        toUserId: blake.userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(offline.status, 409);
+
+      const blakeBeat = await blake.agent.post('/api/peers/heartbeat').set('X-CSRF-Token', blake.csrf);
+      assert.equal(blakeBeat.status, 200);
+
+      const ask = await blake.agent.post('/api/signals').set('X-CSRF-Token', blake.csrf).send({
+        fileId,
+        toUserId: ada.userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(ask.status, 200);
+      const transferId = ask.body.transferId as string;
+
+      const notOffer = await blake.agent.post('/api/signals').set('X-CSRF-Token', blake.csrf).send({
+        fileId,
+        toUserId: ada.userId,
+        kind: 'offer',
+        transferId,
+        payload: '{"type":"offer","sdp":"v=0"}',
+      });
+      assert.equal(notOffer.status, 403);
+
+      const offer = await ada.agent.post('/api/signals').set('X-CSRF-Token', ada.csrf).send({
+        fileId,
+        toUserId: blake.userId,
+        kind: 'offer',
+        transferId,
+        payload: '{"type":"offer","sdp":"v=0"}',
+      });
+      assert.equal(offer.status, 200);
+
+      const ownerInbox = await ada.agent.get('/api/signals');
+      assert.equal(ownerInbox.body.signals.length, 1);
+      assert.equal(ownerInbox.body.signals[0].kind, 'request');
+      assert.equal(JSON.stringify(ownerInbox.body).includes('sdp'), false);
+
+      const receiverInbox = await blake.agent.get('/api/signals');
+      assert.equal(receiverInbox.body.signals.length, 1);
+      assert.equal(receiverInbox.body.signals[0].kind, 'offer');
+      assert.equal(receiverInbox.body.signals[0].fromUserId, ada.userId);
+      const cleared = await blake.agent.get('/api/signals');
+      assert.equal(cleared.body.signals.length, 0);
+
+      const casey = await account(handle, 'casey');
+      const outsider = await casey.agent.post('/api/signals').set('X-CSRF-Token', casey.csrf).send({
+        fileId,
+        toUserId: blake.userId,
+        kind: 'ice',
+        transferId,
+        payload: '{"candidate":"x"}',
+      });
+      assert.equal(outsider.status, 403);
+
+      const huge = await ada.agent.post('/api/signals').set('X-CSRF-Token', ada.csrf).send({
+        fileId,
+        toUserId: blake.userId,
+        kind: 'ice',
+        transferId,
+        payload: 'x'.repeat(13_000),
+      });
+      assert.equal(huge.status, 400);
+
+      const missing = await blake.agent.post('/api/signals').set('X-CSRF-Token', blake.csrf).send({
+        fileId: randomUUID(),
+        toUserId: ada.userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(missing.status, 404);
+    });
+  });
 });
 
 async function writePattern(filePath: string, size: number): Promise<void> {

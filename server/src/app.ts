@@ -60,6 +60,7 @@ import {
   tagExists,
 } from './catalog.js';
 import { formatBytes } from './format.js';
+import { createPeerHub } from './peers.js';
 import { scheduleThumbnail } from './jobs.js';
 import { imageContentType, previewKind, readTextSample, TEXT_PREVIEW_MAX_BYTES } from './preview.js';
 import { hashPassword, passwordProblem, verifyPassword } from './passwords.js';
@@ -115,6 +116,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   const passwordCost = options.passwordCost ?? 12;
   const dummyHash = await hashPassword('not-a-real-password', passwordCost);
   const slots = new UploadSlots(config.maxUploadsPerUser, config.maxUploadsGlobal);
+  const peers = createPeerHub();
   const limits = publicLimits(config);
 
   const app = express();
@@ -194,6 +196,43 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
       await saveSession(req);
       res.json(sessionBody(user, req.session.csrfToken ?? '', config));
     })().catch(next);
+  });
+
+  app.post('/api/peers/heartbeat', requireAuth, requireCsrf, (req, res) => {
+    peers.beat(req.session.userId!);
+    res.json({ ok: true });
+  });
+
+  app.get('/api/peers', requireAuth, (req, res) => {
+    res.json({ online: peers.onlineIds() });
+  });
+
+  app.get('/api/signals', requireAuth, (req, res) => {
+    res.json({ signals: peers.take(req.session.userId!) });
+  });
+
+  app.post('/api/signals', requireAuth, requireCsrf, (req, res) => {
+    const body = req.body ?? {};
+    const fileId = typeof body.fileId === 'string' ? body.fileId : '';
+    const record = getReadyFile(db, fileId, req.session.userId!);
+    if (!record) {
+      res.status(404).json({ error: 'That file is not available.' });
+      return;
+    }
+    const result = peers.post({
+      fromUserId: req.session.userId!,
+      fileOwnerId: record.ownerId,
+      fileId: record.id,
+      toUserId: typeof body.toUserId === 'string' ? body.toUserId : '',
+      kind: typeof body.kind === 'string' ? body.kind : '',
+      transferId: typeof body.transferId === 'string' ? body.transferId : undefined,
+      payload: body.payload,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ transferId: result.transferId });
   });
 
   app.post('/api/auth/logout', requireAuth, requireCsrf, (req, res, next) => {

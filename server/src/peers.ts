@@ -68,6 +68,9 @@ export function createPeerHub() {
     if (payload.length > MAX_PAYLOAD) {
       return { ok: false, status: 400, error: 'That direct-send message is too large.' };
     }
+    if ((kind === 'offer' || kind === 'answer') && !payload.includes('"sdp"')) {
+      return { ok: false, status: 400, error: 'That direct-send message is incomplete.' };
+    }
     if (kind === 'request') {
       if (input.toUserId !== input.fileOwnerId) {
         return { ok: false, status: 403, error: 'Ask the person who uploaded the file.' };

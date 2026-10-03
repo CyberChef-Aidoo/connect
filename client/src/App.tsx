@@ -13,9 +13,11 @@ import {
   detachTag,
   ensureFolder,
   getSession,
+  heartbeat,
   listBin,
   listCollections,
   listFiles,
+  listPeers,
   listTags,
   listUploads,
   listVersions,
@@ -30,6 +32,7 @@ import {
   restoreFile,
   setFavorite,
   tagFiles,
+  takeSignals,
   uploadFile,
   zipUrl,
   type BinFile,
@@ -43,7 +46,9 @@ import {
   type TagItem,
   type UploadSession,
 } from './api';
+import { createDirectHub } from './directSend';
 import { folderPlacement, readDataTransfer, type PlannedUpload } from './folderUpload';
+import { rememberLocalFile } from './localFiles';
 import { formatBytes, formatWhen } from './format';
 import { selectionMatchesSession } from './resumeMatch';
 import { formatRemaining, formatSpeed, rememberSample, transferView, type TransferSample } from './transfer';
@@ -231,12 +236,45 @@ function Dashboard({
   const [binOpen, setBinOpen] = useState(false);
   const [binFiles, setBinFiles] = useState<BinFile[]>([]);
   const [binDays, setBinDays] = useState(30);
+  const [online, setOnline] = useState<string[]>([]);
+  const [takingId, setTakingId] = useState<string | null>(null);
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
+  const direct = useRef(createDirectHub());
   const started = useRef(new Set<string>());
   const controllers = useRef(new Map<string, AbortController>());
   const csrf = session.csrfToken;
   const pageCap = Math.max(1, Math.min(3, session.uploads.maxPerUser));
   const statusSummary = uploads.map((item) => `${item.id}:${item.status}`).join('|');
+
+  useEffect(() => {
+    const hub = direct.current;
+    let stop = false;
+    let polling = false;
+    const timer = window.setInterval(() => {
+      if (polling || stop) return;
+      polling = true;
+      void (async () => {
+        try {
+          await heartbeat(csrf);
+          const [people, inbox] = await Promise.all([listPeers(), takeSignals()]);
+          if (stop) return;
+          setOnline(people.online);
+          for (const signal of inbox.signals) {
+            await hub.handle(signal, csrf);
+          }
+        } catch (caught) {
+          if (!stop && caught instanceof ApiError && caught.status === 401) onSession(null);
+        } finally {
+          polling = false;
+        }
+      })();
+    }, 2000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+      hub.close();
+    };
+  }, [csrf, onSession]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -415,7 +453,7 @@ function Dashboard({
       samples: [{ at: startedAt, loaded: item.loaded }],
     }));
     try {
-      await uploadFile(item.file, csrf, (loaded, total) => {
+      const saved = await uploadFile(item.file, csrf, (loaded, total) => {
         const now = Date.now();
         patchUpload(item.id, attempt, (entry) => {
           const samples = rememberSample(entry.samples, { at: now, loaded });
@@ -446,6 +484,7 @@ function Dashboard({
           }));
         },
       });
+      rememberLocalFile(saved.id, item.file);
       patchUpload(item.id, attempt, (entry) => ({
         ...entry,
         status: 'done',
@@ -801,6 +840,29 @@ function Dashboard({
     localStorage.setItem(CONCURRENCY_KEY, String(next));
   }
 
+  function canDirect(file: PortalFile): boolean {
+    return file.ownerId !== session.user.id && online.includes(file.ownerId);
+  }
+
+  async function takeDirect(file: PortalFile) {
+    setListError('');
+    setTakingId(file.id);
+    try {
+      const blob = await direct.current.requestFile(file.id, file.ownerId, csrf);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = file.originalName;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setBanner(`Received ${file.originalName} directly.`);
+    } catch (caught) {
+      setListError(caught instanceof Error ? caught.message : 'Direct send is not available. Use Download.');
+    } finally {
+      setTakingId(null);
+    }
+  }
+
   async function signOut() {
     try {
       await logout(csrf);
@@ -860,6 +922,7 @@ function Dashboard({
       {listError ? <p className="banner error" role="alert">{listError}</p> : null}
 
       <section className="panel">
+        <p className="meta">Direct asks the uploader’s open browser to send the file on this network. Download uses the copy stored on this computer. A direct send works only while that person still has the file from an upload in this visit, and only for files up to 256 MB.</p>
         <FolderBar
           breadcrumbs={listing?.breadcrumbs ?? []}
           draft={folderDraft}
@@ -990,6 +1053,9 @@ function Dashboard({
             onChanged={refresh}
             onError={setListError}
             onPreview={setPreviewing}
+            canDirect={canDirect}
+            takingId={takingId}
+            onDirect={(file) => void takeDirect(file)}
           />
         ) : (
           <FileTable
@@ -1005,6 +1071,9 @@ function Dashboard({
             onChanged={refresh}
             onError={setListError}
             onPreview={setPreviewing}
+            canDirect={canDirect}
+            takingId={takingId}
+            onDirect={(file) => void takeDirect(file)}
           />
         )}
         <PreviewDialog file={previewing} onClose={() => setPreviewing(null)} />
@@ -1380,6 +1449,9 @@ function FileTable({
   onChanged,
   onError,
   onPreview,
+  canDirect,
+  takingId,
+  onDirect,
 }: {
   files: PortalFile[];
   loading: boolean;
@@ -1393,6 +1465,9 @@ function FileTable({
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
   onPreview: (file: PortalFile) => void;
+  canDirect: (file: PortalFile) => boolean;
+  takingId: string | null;
+  onDirect: (file: PortalFile) => void;
 }) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -1426,7 +1501,7 @@ function FileTable({
   return (
     <div className="table-wrap">
       <table>
-        <caption>You can delete files you uploaded. Anyone signed in can download.</caption>
+        <caption>You can delete files you uploaded. Anyone signed in can download. Direct sends from the uploader’s open browser when they are here.</caption>
         <thead>
           <tr>
             <th scope="col">
@@ -1480,6 +1555,11 @@ function FileTable({
                   <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
                 ) : null}
                 <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
+                {canDirect(file) ? (
+                  <button type="button" className="ghost" disabled={takingId === file.id} onClick={() => onDirect(file)}>
+                    {takingId === file.id ? 'Receiving…' : 'Direct'}
+                  </button>
+                ) : null}
                 <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
                 {file.canDelete && pendingDelete !== file.id ? (
                   <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
@@ -1514,6 +1594,9 @@ function FileGrid({
   onChanged,
   onError,
   onPreview,
+  canDirect,
+  takingId,
+  onDirect,
 }: {
   files: PortalFile[];
   loading: boolean;
@@ -1526,6 +1609,9 @@ function FileGrid({
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
   onPreview: (file: PortalFile) => void;
+  canDirect: (file: PortalFile) => boolean;
+  takingId: string | null;
+  onDirect: (file: PortalFile) => void;
 }) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -1582,6 +1668,11 @@ function FileGrid({
               <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
             ) : null}
             <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
+            {canDirect(file) ? (
+              <button type="button" className="ghost" disabled={takingId === file.id} onClick={() => onDirect(file)}>
+                {takingId === file.id ? 'Receiving…' : 'Direct'}
+              </button>
+            ) : null}
             <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
             {file.canDelete && pendingDelete !== file.id ? (
               <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
