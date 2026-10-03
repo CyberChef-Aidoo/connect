@@ -1008,6 +1008,57 @@ describe('portal', () => {
     });
   });
 
+  it('keeps an earlier version only when the uploader replaces a file', async () => {
+    await withPortal({ maxStorageBytes: 24 }, async (handle) => {
+      const ada = await account(handle, 'ada');
+      const blake = await account(handle, 'blake');
+      const original = await uploadNamed(ada.agent, ada.csrf, 'notes.txt', '12345678');
+      assert.equal(original.status, 201);
+      const fileId = original.body.file.id as string;
+      assert.equal((await request(handle.app).post(`/api/files/${fileId}/replace`)).status, 401);
+      assert.equal((await ada.agent.post(`/api/files/${fileId}/replace`).attach('file', Buffer.from('87654321'), 'notes.txt')).status, 403);
+
+      const replaced = await ada.agent
+        .post(`/api/files/${fileId}/replace`)
+        .set('X-CSRF-Token', ada.csrf)
+        .attach('file', Buffer.from('87654321'), { filename: 'renamed.txt' });
+      assert.equal(replaced.status, 201, JSON.stringify(replaced.body));
+      assert.equal(replaced.body.file.originalName, 'renamed.txt');
+      assert.equal(replaced.body.file.versionCount, 1);
+      assert.equal(replaced.body.file.id, fileId);
+      const current = await ada.agent.get(`/api/files/${fileId}/download`);
+      assert.equal(responseText(current), '87654321');
+      const versions = await ada.agent.get(`/api/files/${fileId}/versions`);
+      assert.equal(versions.body.versions.length, 1);
+      assert.equal(versions.body.versions[0].originalName, 'notes.txt');
+      const versionId = versions.body.versions[0].id as string;
+      const earlier = await blake.agent.get(`/api/files/${fileId}/versions/${versionId}/download`);
+      assert.equal(earlier.status, 200);
+      assert.equal(responseText(earlier), '12345678');
+      assert.match(String(earlier.headers['content-disposition']), /attachment/);
+      assert.equal((await blake.agent.delete(`/api/files/${fileId}/versions/${versionId}`).set('X-CSRF-Token', blake.csrf)).status, 403);
+      assert.equal((await ada.agent.get('/api/files')).body.storage.usedBytes, 16);
+
+      const again = await uploadNamed(ada.agent, ada.csrf, 'notes.txt', 'abcdefgh');
+      assert.equal(again.status, 201);
+      assert.notEqual(again.body.file.id, fileId);
+      assert.equal((await ada.agent.get('/api/files')).body.files.length, 2);
+
+      const blocked = await ada.agent
+        .post(`/api/files/${fileId}/replace`)
+        .set('X-CSRF-Token', ada.csrf)
+        .attach('file', Buffer.from('zzzzzzzz'), { filename: 'renamed.txt' });
+      assert.equal(blocked.status, 507);
+      assert.equal(responseText(await ada.agent.get(`/api/files/${fileId}/download`)), '87654321');
+
+      assert.equal((await ada.agent.delete(`/api/files/${fileId}/versions/${versionId}`).set('X-CSRF-Token', ada.csrf)).status, 200);
+      assert.equal((await ada.agent.get('/api/files')).body.storage.usedBytes, 16);
+      const versionPath = objectPath(handle.config.storageDir, versionId);
+      assert.ok(versionPath);
+      await assert.rejects(stat(versionPath));
+    });
+  });
+
   it('keeps a deleted file in the owner bin until it is restored or expires', async () => {
     await withPortal({ maxStorageBytes: 10 }, async (handle) => {
       const ada = await account(handle, 'ada');

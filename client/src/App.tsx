@@ -1581,6 +1581,7 @@ function FileGrid({
             {file.preview === 'image' || file.preview === 'text' ? (
               <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
             ) : null}
+            <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
             <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
             {file.canDelete && pendingDelete !== file.id ? (
               <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
@@ -1679,6 +1680,110 @@ function FileMarks({
       </form>
       {collectionId ? (
         <button type="button" className="ghost" onClick={() => void leaveCollection()}>Remove from collection</button>
+      ) : null}
+    </div>
+  );
+}
+
+function FileHistory({
+  file,
+  csrfToken,
+  onChanged,
+  onError,
+}: {
+  file: PortalFile;
+  csrfToken: string;
+  onChanged: () => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [versions, setVersions] = useState<FileVersion[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  async function chooseReplacement(list: FileList | null) {
+    const next = list?.[0];
+    if (!next) return;
+    setBusy(true);
+    onError('');
+    try {
+      await replaceFile(file.id, next, csrfToken);
+      setOpen(false);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The file could not be replaced.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function showVersions() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    onError('');
+    try {
+      const next = await listVersions(file.id);
+      setVersions(next.versions);
+      setOpen(true);
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The earlier versions could not be loaded.');
+    }
+  }
+
+  async function removeVersion(versionId: string) {
+    setBusy(true);
+    onError('');
+    try {
+      await deleteVersion(file.id, versionId, csrfToken);
+      const next = await listVersions(file.id);
+      setVersions(next.versions);
+      await onChanged();
+    } catch (caught) {
+      onError(caught instanceof ApiError ? caught.message : 'The version could not be removed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="history">
+      {file.canDelete ? (
+        <>
+          <button type="button" className="ghost" disabled={busy} onClick={() => inputRef.current?.click()}>
+            {busy ? 'Replacing…' : 'Replace'}
+          </button>
+          <input
+            ref={inputRef}
+            type="file"
+            aria-label={`Replace ${file.originalName}`}
+            onChange={(event) => {
+              const chosen = event.target.files;
+              event.target.value = '';
+              void chooseReplacement(chosen);
+            }}
+          />
+        </>
+      ) : null}
+      {(file.versionCount ?? 0) > 0 ? (
+        <button type="button" className="ghost" aria-expanded={open} onClick={() => void showVersions()}>
+          {file.versionCount === 1 ? '1 earlier version' : `${file.versionCount} earlier versions`}
+        </button>
+      ) : null}
+      {open ? (
+        <ul className="versions">
+          {versions.map((version) => (
+            <li key={version.id}>
+              <span>{version.originalName}</span>
+              <span className="meta">{formatBytes(version.sizeBytes)} · {formatWhen(version.createdAt)}</span>
+              <a href={`/api/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(version.id)}/download`}>Download</a>
+              {file.canDelete ? (
+                <button type="button" className="ghost danger" disabled={busy} onClick={() => void removeVersion(version.id)}>Remove</button>
+              ) : null}
+            </li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );
