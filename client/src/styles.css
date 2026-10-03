@@ -42,7 +42,7 @@ body {
   color: var(--ink);
 }
 
-button, input, select { font: inherit; }
+button, .button, input, select { font: inherit; }
 
 button, .button {
   background: var(--accent);
@@ -55,6 +55,7 @@ button, .button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  line-height: 1.2;
 }
 
 button:hover, .button:hover { background: var(--accent-dark); }
@@ -72,7 +73,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .ghost:hover { background: var(--track); }
 .danger { background: var(--danger); color: white; }
+.danger:hover { background: #7d2424; color: white; }
 .ghost.danger { color: var(--danger); background: transparent; }
+.ghost.danger:hover { background: var(--track); color: var(--danger); }
+
+html[data-theme="dark"] .danger { background: #8d2f2f; color: #fff; }
+html[data-theme="dark"] .danger:hover { background: #a33b3b; color: #fff; }
+html[data-theme="dark"] .ghost.danger { background: transparent; color: #ffb4b4; }
+html[data-theme="dark"] .ghost.danger:hover { background: var(--track); color: #ffb4b4; }
 
 .gate {
   min-height: 100vh;
@@ -136,8 +144,33 @@ progress { accent-color: var(--accent); }
 .drop p { margin: 0; }
 .drop input { display: none; }
 .drop-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.bulk { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.8rem; }
-.bulk input, .bulk select { width: auto; min-width: 8rem; }
+.bulk {
+  display: grid;
+  gap: 0.65rem;
+  margin-bottom: 0.9rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--track) 65%, var(--panel));
+}
+.bulk-count { margin: 0; font-weight: 700; }
+.bulk-note { color: var(--muted); }
+.bulk-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.bulk-actions > button,
+.bulk-actions > .button {
+  min-height: 2.75rem;
+  padding: 0.55rem 1.05rem;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.bulk-actions > button.ghost { border-color: var(--line); }
+.bulk input, .bulk select {
+  width: auto;
+  min-width: 8rem;
+  min-height: 2.75rem;
+  margin: 0;
+}
 .marks { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
 .star { min-width: 2rem; }
 .chip { display: inline-flex; gap: 0.2rem; align-items: center; padding: 0.1rem 0.35rem; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); }

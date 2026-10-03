@@ -934,33 +934,37 @@ function Dashboard({
         />
         {selected.length > 0 ? (
           <div className="bulk">
-            <span>{selected.length} selected</span>
-            <button type="button" onClick={() => void moveSelected()}>Move to this folder</button>
-            {confirmBulkDelete ? (
-              <>
-                <span>Move the files you uploaded to the bin?</span>
-                <button type="button" className="danger" onClick={() => void deleteSelected()}>Delete</button>
-                <button type="button" className="ghost" onClick={() => setConfirmBulkDelete(false)}>Keep</button>
-              </>
-            ) : (
-              <button type="button" className="danger" onClick={() => setConfirmBulkDelete(true)}>Delete selected</button>
-            )}
-            {selected.length <= 100 ? <a className="button" href={zipUrl(selected)}>Download zip</a> : null}
-            <input
-              aria-label="Tag for selected files"
-              value={tagDraft}
-              placeholder="Tag"
-              list="portal-tags"
-              onChange={(event) => setTagDraft(event.target.value)}
-            />
-            <button type="button" onClick={() => void tagSelected()}>Tag selected</button>
-            <label className="sr" htmlFor="bulk-collection">Collection for selected files</label>
-            <select id="bulk-collection" value={bulkCollectionId} onChange={(event) => setBulkCollectionId(event.target.value)}>
-              <option value="">Add to collection</option>
-              {collections.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-            <button type="button" disabled={!bulkCollectionId} onClick={() => void collectSelected()}>Add to collection</button>
-            <button type="button" className="ghost" onClick={() => { setSelected([]); setConfirmBulkDelete(false); }}>Clear</button>
+            <p className="bulk-count">{selected.length} selected</p>
+            <div className="bulk-actions">
+              <button type="button" onClick={() => void moveSelected()}>Move to this folder</button>
+              {confirmBulkDelete ? (
+                <>
+                  <span className="bulk-note">Move the files you uploaded to the bin?</span>
+                  <button type="button" className="danger" onClick={() => void deleteSelected()}>Delete</button>
+                  <button type="button" className="ghost" onClick={() => setConfirmBulkDelete(false)}>Keep</button>
+                </>
+              ) : (
+                <button type="button" className="danger" onClick={() => setConfirmBulkDelete(true)}>Delete selected</button>
+              )}
+              {selected.length <= 100 ? <a className="button" href={zipUrl(selected)}>Download zip</a> : <span className="bulk-note">Choose 100 files or fewer for a zip.</span>}
+            </div>
+            <div className="bulk-actions">
+              <input
+                aria-label="Tag for selected files"
+                value={tagDraft}
+                placeholder="Tag"
+                list="portal-tags"
+                onChange={(event) => setTagDraft(event.target.value)}
+              />
+              <button type="button" onClick={() => void tagSelected()}>Tag selected</button>
+              <label className="sr" htmlFor="bulk-collection">Collection for selected files</label>
+              <select id="bulk-collection" value={bulkCollectionId} onChange={(event) => setBulkCollectionId(event.target.value)}>
+                <option value="">Add to collection</option>
+                {collections.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </select>
+              <button type="button" disabled={!bulkCollectionId} onClick={() => void collectSelected()}>Add to collection</button>
+              <button type="button" className="ghost" onClick={() => { setSelected([]); setConfirmBulkDelete(false); }}>Clear</button>
+            </div>
           </div>
         ) : null}
         <div className="toolbar">
