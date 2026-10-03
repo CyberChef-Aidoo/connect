@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
-import { rename, rm, truncate, writeFile } from 'node:fs/promises';
+import { copyFile, rename, rm, truncate, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -14,11 +14,16 @@ import {
   deleteOwnedFile,
   deleteOwnedFiles,
   getReadyFile,
+  commitReplacement,
+  deleteOwnedVersion,
   listBin,
+  listFileVersions,
   listFiles,
   purgeOwnedBinFile,
+  replacementTarget,
   restoreOwnedFile,
   takeExpiredBinIds,
+  versionIdsForFile,
   DEFAULT_PAGE_SIZE,
   displayedUsedBytes,
   MAX_PAGE_SIZE,
@@ -505,6 +510,34 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
 
   app.get('/api/files/:id/download', requireAuth, (req, res, next) => {
     void handleDownload(req, res, db, config).catch(next);
+  });
+
+  app.post('/api/files/:id/replace', requireAuth, requireCsrf, (req, res, next) => {
+    void handleReplace(req, res, { db, config, slots }).catch(next);
+  });
+
+  app.get('/api/files/:id/versions', requireAuth, (req, res) => {
+    const record = getReadyFile(db, routeId(req), req.session.userId!);
+    if (!record) {
+      res.status(404).json({ error: 'That file is not in the portal.' });
+      return;
+    }
+    res.json({
+      versions: listFileVersions(db, record.id).map((version) => ({
+        id: version.id,
+        originalName: version.originalName,
+        sizeBytes: version.sizeBytes,
+        createdAt: version.createdAt,
+      })),
+    });
+  });
+
+  app.get('/api/files/:id/versions/:versionId/download', requireAuth, (req, res, next) => {
+    void handleVersionDownload(req, res, db, config).catch(next);
+  });
+
+  app.delete('/api/files/:id/versions/:versionId', requireAuth, requireCsrf, (req, res, next) => {
+    void handleVersionDelete(req, res, db, config).catch(next);
   });
 
   app.post('/api/files/:id/restore', requireAuth, requireCsrf, (req, res) => {
@@ -1080,6 +1113,191 @@ function sendJson(res: Response, status: number, body: unknown): void {
   res.status(status).json(body);
 }
 
+const replacing = new Set<string>();
+
+async function handleReplace(
+  req: Request,
+  res: Response,
+  ctx: { db: DatabaseSync; config: AppConfig; slots: UploadSlots },
+): Promise<void> {
+  await sweepBin(ctx.db, ctx.config);
+  const userId = req.session.userId!;
+  const fileId = routeId(req);
+  const currentPath = objectPath(ctx.config.storageDir, fileId);
+  const target = currentPath ? replacementTarget(ctx.db, fileId, userId) : { ok: false as const, reason: 'missing' as const };
+  if (!target.ok) {
+    req.resume();
+    sendReplacementFailure(res, target.reason);
+    return;
+  }
+  if (replacing.has(fileId)) {
+    req.resume();
+    res.status(409).json({ error: 'That file is already being replaced.' });
+    return;
+  }
+  if (!ctx.slots.tryAcquire(userId)) {
+    res.status(429).json({ error: 'Too many uploads are already running. Wait for one to finish.' });
+    return;
+  }
+  replacing.add(fileId);
+  const tempId = randomUUID();
+  const partial = tempPath(ctx.config.storageDir, tempId);
+  try {
+    const claimed = Number(req.headers['content-length']);
+    if (Number.isFinite(claimed) && claimed > ctx.config.maxFileBytes + 256 * 1024) {
+      res.status(413).json({
+        error: `Each file must be ${formatBytes(ctx.config.maxFileBytes)} or smaller.`,
+      });
+      return;
+    }
+    const contentType = req.headers['content-type'];
+    if (!contentType || !contentType.toLowerCase().includes('multipart/form-data')) {
+      res.status(400).json({ error: 'Choose a file to upload.' });
+      return;
+    }
+    if (!partial || !currentPath) {
+      res.status(500).json({ error: 'The upload could not be saved.' });
+      return;
+    }
+    const received = await receiveUpload({
+      req,
+      tmpPath: partial,
+      maxFileBytes: ctx.config.maxFileBytes,
+      sanitizeName: sanitizeOriginalName,
+    });
+    if (received.status !== 'ok') {
+      await discardTemp(partial);
+      sendReceiveFailure(res, received, ctx.config.maxFileBytes);
+      return;
+    }
+    if (received.sizeBytes > ctx.config.maxFileBytes) {
+      await discardTemp(partial);
+      res.status(413).json({
+        error: `Each file must be ${formatBytes(ctx.config.maxFileBytes)} or smaller.`,
+      });
+      return;
+    }
+    await syncFile(partial);
+    const versionId = randomUUID();
+    const versionPath = objectPath(ctx.config.storageDir, versionId);
+    if (!versionPath || (await fileSize(currentPath)) === null) {
+      await discardTemp(partial);
+      res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+      return;
+    }
+    await copyFile(currentPath, versionPath);
+    await rm(currentPath, { force: true });
+    try {
+      await rename(partial, currentPath);
+    } catch (error) {
+      await copyFile(versionPath, currentPath);
+      await rm(versionPath, { force: true });
+      throw error;
+    }
+    const committed = commitReplacement(ctx.db, {
+      fileId,
+      ownerId: userId,
+      versionId,
+      newName: received.originalName,
+      newSize: received.sizeBytes,
+      now: new Date().toISOString(),
+    }, ctx.config.maxStorageBytes);
+    if (!committed.ok) {
+      await rm(currentPath, { force: true });
+      await rename(versionPath, currentPath);
+      sendReplacementFailure(res, committed.reason);
+      return;
+    }
+    const thumb = thumbPath(ctx.config.storageDir, fileId);
+    if (thumb) await rm(thumb, { force: true });
+    const file = getReadyFile(ctx.db, fileId, userId);
+    if (file) scheduleThumbnail(ctx.config.storageDir, file);
+    res.status(201).json({ file });
+  } catch (error) {
+    await discardTemp(partial);
+    if (!res.headersSent) {
+      const mapped = mapFsError(error);
+      res.status(mapped.httpStatus).json({ error: mapped.message });
+    }
+  } finally {
+    replacing.delete(fileId);
+    ctx.slots.release(userId);
+  }
+}
+
+function sendReceiveFailure(res: Response, received: { status: string; httpStatus?: number; message?: string }, maxFileBytes: number): void {
+  if (received.status === 'aborted') return;
+  if (received.status === 'nofile') {
+    res.status(400).json({ error: 'Choose a file to upload.' });
+    return;
+  }
+  if (received.status === 'badname') {
+    res.status(400).json({ error: 'That file name cannot be used.' });
+    return;
+  }
+  if (received.status === 'toolarge') {
+    res.status(413).json({ error: `Each file must be ${formatBytes(maxFileBytes)} or smaller.` });
+    return;
+  }
+  if (received.status === 'io') {
+    res.status(received.httpStatus ?? 500).json({ error: received.message ?? 'The upload could not be saved.' });
+  }
+}
+
+function sendReplacementFailure(res: Response, reason: 'missing' | 'forbidden' | 'quota'): void {
+  if (reason === 'quota') {
+    res.status(507).json({ error: 'Shared storage is full.' });
+    return;
+  }
+  if (reason === 'forbidden') {
+    res.status(403).json({ error: 'You can replace only files you uploaded.' });
+    return;
+  }
+  res.status(404).json({ error: 'That file is not in the portal.' });
+}
+
+async function handleVersionDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const record = getReadyFile(db, routeId(req), req.session.userId!);
+  const versionId = typeof req.params.versionId === 'string' ? req.params.versionId : '';
+  const version = record ? listFileVersions(db, record.id).find((item) => item.id === versionId) : undefined;
+  if (!record || !version) {
+    res.status(404).json({ error: 'That version is not in the portal.' });
+    return;
+  }
+  const finalPath = objectPath(config.storageDir, version.id);
+  const size = finalPath ? await fileSize(finalPath) : null;
+  if (!finalPath || size !== version.sizeBytes) {
+    res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+    return;
+  }
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(size));
+  res.setHeader('Content-Disposition', attachmentDisposition(version.originalName));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  const stream = createReadStream(finalPath);
+  stream.on('error', () => {
+    if (!res.headersSent) res.status(500).end();
+    else res.destroy();
+  });
+  await pipeline(stream, res).catch(() => undefined);
+}
+
+async function handleVersionDelete(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+  const versionId = typeof req.params.versionId === 'string' ? req.params.versionId : '';
+  const result = deleteOwnedVersion(db, routeId(req), versionId, req.session.userId!);
+  if (result === 'forbidden') {
+    res.status(403).json({ error: 'You can remove only versions of files you uploaded.' });
+    return;
+  }
+  if (result === 'missing') {
+    res.status(404).json({ error: 'That version is not in the portal.' });
+    return;
+  }
+  await discardStoredFile(config, versionId);
+  res.json({ ok: true });
+}
+
 async function handleUpload(
   req: Request,
   res: Response,
@@ -1374,6 +1592,7 @@ async function handleBin(req: Request, res: Response, db: DatabaseSync, config: 
 
 async function handlePermanentDelete(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
   const id = routeId(req);
+  const versionIds = versionIdsForFile(db, id);
   const result = purgeOwnedBinFile(db, id, req.session.userId!);
   if (result === 'missing') {
     res.status(404).json({ error: 'That file is not in the bin.' });
@@ -1384,14 +1603,18 @@ async function handlePermanentDelete(req: Request, res: Response, db: DatabaseSy
     return;
   }
   await discardStoredFile(config, id);
+  for (const versionId of versionIds) await discardStoredFile(config, versionId);
   removeUnusedTags(db);
   res.json({ ok: true });
 }
 
 async function sweepBin(db: DatabaseSync, config: AppConfig): Promise<void> {
-  const ids = takeExpiredBinIds(db);
-  for (const id of ids) await discardStoredFile(config, id);
-  if (ids.length > 0) removeUnusedTags(db);
+  const expired = takeExpiredBinIds(db);
+  for (const item of expired) {
+    await discardStoredFile(config, item.id);
+    for (const versionId of item.versionIds) await discardStoredFile(config, versionId);
+  }
+  if (expired.length > 0) removeUnusedTags(db);
 }
 
 async function discardStoredFile(config: AppConfig, id: string): Promise<void> {

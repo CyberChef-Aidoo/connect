@@ -41,7 +41,7 @@ export function usedBytes(db: DatabaseSync): number {
   const row = db.prepare(
     "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM files WHERE state IN ('staging', 'ready')",
   ).get() as { used: unknown };
-  return sqlNumber(row.used);
+  return sqlNumber(row.used) + versionBytes(db);
 }
 
 export const BIN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -53,19 +53,24 @@ export function readyBytes(db: DatabaseSync): number {
   return sqlNumber(row.used);
 }
 
+export function versionBytes(db: DatabaseSync): number {
+  const row = db.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS used FROM file_versions').get() as { used: unknown };
+  return sqlNumber(row.used);
+}
+
 export function reservedBytes(db: DatabaseSync): number {
   const files = db.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS used FROM files').get() as { used: unknown };
   const sessions = db.prepare(
     'SELECT COALESCE(SUM(size_bytes), 0) AS used FROM upload_sessions',
   ).get() as { used: unknown };
-  return sqlNumber(files.used) + sqlNumber(sessions.used);
+  return sqlNumber(files.used) + sqlNumber(sessions.used) + versionBytes(db);
 }
 
 export function displayedUsedBytes(db: DatabaseSync): number {
   const sessions = db.prepare(
     'SELECT COALESCE(SUM(size_bytes), 0) AS used FROM upload_sessions',
   ).get() as { used: unknown };
-  return readyBytes(db) + sqlNumber(sessions.used);
+  return readyBytes(db) + sqlNumber(sessions.used) + versionBytes(db);
 }
 
 export function stageFile(
@@ -151,7 +156,8 @@ export function listFiles(
   }
 
   const rows = db.prepare(`
-    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, u.username, d.name AS folder_name
+    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, u.username, d.name AS folder_name,
+      (SELECT COUNT(*) FROM file_versions v WHERE v.file_id = f.id) AS version_count
     FROM files f
     JOIN users u ON u.id = f.owner_id
     LEFT JOIN folders d ON d.id = f.folder_id
@@ -172,7 +178,8 @@ export function listFiles(
 
 export function getReadyFile(db: DatabaseSync, id: string, userId: string): FileRecord | undefined {
   const row = db.prepare(`
-    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, u.username, d.name AS folder_name
+    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, u.username, d.name AS folder_name,
+      (SELECT COUNT(*) FROM file_versions v WHERE v.file_id = f.id) AS version_count
     FROM files f
     JOIN users u ON u.id = f.owner_id
     LEFT JOIN folders d ON d.id = f.folder_id
@@ -250,7 +257,8 @@ export type BinFile = FileRecord & { deletedAt: string };
 
 export function listBin(db: DatabaseSync, userId: string): BinFile[] {
   const rows = db.prepare(`
-    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, f.deleted_at, u.username, d.name AS folder_name
+    SELECT f.id, f.original_name, f.size_bytes, f.created_at, f.owner_id, f.folder_id, f.deleted_at, u.username, d.name AS folder_name,
+      (SELECT COUNT(*) FROM file_versions v WHERE v.file_id = f.id) AS version_count
     FROM files f
     JOIN users u ON u.id = f.owner_id
     LEFT JOIN folders d ON d.id = f.folder_id
@@ -290,12 +298,14 @@ export function takeExpiredBinIds(db: DatabaseSync, nowMs = Date.now()): string[
     const rows = db.prepare(
       "SELECT id FROM files WHERE state = 'ready' AND deleted_at IS NOT NULL AND deleted_at <= ?",
     ).all(cutoff) as Array<{ id: string }>;
+    const versions = db.prepare('SELECT id FROM file_versions WHERE file_id = ?');
     const remove = db.prepare('DELETE FROM files WHERE id = ? AND deleted_at IS NOT NULL');
-    const ids: string[] = [];
+    const expired: Array<{ id: string; versionIds: string[] }> = [];
     for (const row of rows) {
-      if (remove.run(row.id).changes === 1) ids.push(row.id);
+      const versionIds = (versions.all(row.id) as Array<{ id: string }>).map((version) => version.id);
+      if (remove.run(row.id).changes === 1) expired.push({ id: row.id, versionIds });
     }
-    return ids;
+    return expired;
   });
 }
 
@@ -319,6 +329,95 @@ export function listStaging(db: DatabaseSync): NewFile[] {
   }));
 }
 
+export type StoredVersion = {
+  id: string;
+  fileId: string;
+  originalName: string;
+  sizeBytes: number;
+  createdAt: string;
+};
+
+export function listFileVersions(db: DatabaseSync, fileId: string): StoredVersion[] {
+  const rows = db.prepare(`
+    SELECT id, file_id, original_name, size_bytes, created_at
+    FROM file_versions WHERE file_id = ? ORDER BY created_at DESC, id DESC
+  `).all(fileId) as Array<{ id: string; file_id: string; original_name: string; size_bytes: unknown; created_at: string }>;
+  return rows.map((row) => ({
+    id: row.id,
+    fileId: row.file_id,
+    originalName: row.original_name,
+    sizeBytes: sqlNumber(row.size_bytes),
+    createdAt: row.created_at,
+  }));
+}
+
+export function listVersionsForRecovery(db: DatabaseSync): Array<{ id: string; sizeBytes: number }> {
+  const rows = db.prepare('SELECT id, size_bytes FROM file_versions').all() as Array<{ id: string; size_bytes: unknown }>;
+  return rows.map((row) => ({ id: row.id, sizeBytes: sqlNumber(row.size_bytes) }));
+}
+
+export function versionIdsForFile(db: DatabaseSync, fileId: string): string[] {
+  return listFileVersions(db, fileId).map((version) => version.id);
+}
+
+export function replacementTarget(
+  db: DatabaseSync,
+  fileId: string,
+  ownerId: string,
+): { ok: true } | { ok: false; reason: 'missing' | 'forbidden' } {
+  const row = db.prepare(
+    "SELECT owner_id, deleted_at FROM files WHERE id = ? AND state = 'ready'",
+  ).get(fileId) as { owner_id: string; deleted_at: string | null } | undefined;
+  if (!row || row.deleted_at) return { ok: false, reason: 'missing' };
+  if (row.owner_id !== ownerId) return { ok: false, reason: 'forbidden' };
+  return { ok: true };
+}
+
+export function commitReplacement(
+  db: DatabaseSync,
+  input: { fileId: string; ownerId: string; versionId: string; newName: string; newSize: number; now: string },
+  maxStorageBytes: number,
+): { ok: true } | { ok: false; reason: 'missing' | 'forbidden' | 'quota' } {
+  return withImmediateTransaction(db, () => {
+    const row = db.prepare(`
+      SELECT owner_id, original_name, size_bytes, created_at, deleted_at
+      FROM files WHERE id = ? AND state = 'ready'
+    `).get(input.fileId) as {
+      owner_id: string;
+      original_name: string;
+      size_bytes: unknown;
+      created_at: string;
+      deleted_at: string | null;
+    } | undefined;
+    if (!row || row.deleted_at) return { ok: false, reason: 'missing' };
+    if (row.owner_id !== input.ownerId) return { ok: false, reason: 'forbidden' };
+    if (reservedBytes(db) + input.newSize > maxStorageBytes) return { ok: false, reason: 'quota' };
+    db.prepare(`
+      INSERT INTO file_versions (id, file_id, original_name, size_bytes, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(input.versionId, input.fileId, row.original_name, sqlNumber(row.size_bytes), row.created_at);
+    db.prepare('UPDATE files SET original_name = ?, size_bytes = ?, created_at = ? WHERE id = ?').run(
+      input.newName,
+      input.newSize,
+      input.now,
+      input.fileId,
+    );
+    return { ok: true };
+  });
+}
+
+export function deleteOwnedVersion(
+  db: DatabaseSync,
+  fileId: string,
+  versionId: string,
+  ownerId: string,
+): 'deleted' | 'missing' | 'forbidden' {
+  const target = replacementTarget(db, fileId, ownerId);
+  if (!target.ok) return target.reason;
+  const result = db.prepare('DELETE FROM file_versions WHERE id = ? AND file_id = ?').run(versionId, fileId);
+  return result.changes === 1 ? 'deleted' : 'missing';
+}
+
 export function listReadyIds(db: DatabaseSync): Array<{ id: string; sizeBytes: number }> {
   const rows = db.prepare(
     "SELECT id, size_bytes FROM files WHERE state = 'ready'",
@@ -335,6 +434,7 @@ type FileRow = {
   folder_id: string | null;
   username: string;
   folder_name: string | null;
+  version_count?: unknown;
 };
 
 function mapFile(row: FileRow, userId: string): FileRecord {
@@ -351,6 +451,7 @@ function mapFile(row: FileRow, userId: string): FileRecord {
     favorite: false,
     tags: [],
     preview: previewKind(row.original_name, sqlNumber(row.size_bytes)),
+    versionCount: sqlNumber(row.version_count),
   };
 }
 

@@ -1,7 +1,7 @@
 import { readdir, rename, rm, truncate } from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { listReadyIds, listStaging, markReady, removeFileRecord } from './files.js';
+import { listReadyIds, listStaging, listVersionsForRecovery, markReady, removeFileRecord } from './files.js';
 import {
   deleteSession,
   listRecoverySessions,
@@ -78,6 +78,18 @@ export async function reconcileStorage(db: DatabaseSync, storageDir: string): Pr
       await discardThumb(storageDir, ready.id);
       report.removedCorrupt += 1;
     }
+  }
+
+  for (const version of listVersionsForRecovery(db)) {
+    const versionPath = objectPath(storageDir, version.id);
+    const size = versionPath ? await fileSize(versionPath) : null;
+    if (versionPath && size === version.sizeBytes) {
+      known.add(version.id);
+      continue;
+    }
+    db.prepare('DELETE FROM file_versions WHERE id = ?').run(version.id);
+    if (versionPath && size !== null) await rm(versionPath, { force: true });
+    report.removedCorrupt += 1;
   }
 
   const objectsDir = path.join(storageDir, 'objects');

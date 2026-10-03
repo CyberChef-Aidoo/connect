@@ -50,6 +50,7 @@ export function openDatabase(databasePath: string): DatabaseSync {
   migrateFolders(db);
   migrateCatalog(db);
   migrateBin(db);
+  migrateVersions(db);
   return db;
 }
 
@@ -120,6 +121,19 @@ function migrateCatalog(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id);
     CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_collection_files_file ON collection_files(file_id);
+  `);
+}
+
+function migrateVersions(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS file_versions (
+      id TEXT PRIMARY KEY,
+      file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      original_name TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id, created_at);
   `);
 }
 

@@ -30,4 +30,5 @@ export type FileRecord = {
   favorite: boolean;
   tags: Array<{ id: string; name: string }>;
   preview: 'image' | 'text' | 'none';
+  versionCount: number;
 };
