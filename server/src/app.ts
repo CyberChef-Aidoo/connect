@@ -133,6 +133,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
         baseUri: ["'none'"],
         frameAncestors: ["'none'"],
         formAction: ["'self'"],
+        upgradeInsecureRequests: config.https ? [] : null,
       },
     },
     // A locally trusted certificate should not be pinned with HSTS.

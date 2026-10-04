@@ -31,7 +31,21 @@ export function uniqueZipName(used: Set<string>, raw: string): string {
   return name;
 }
 
+export type ZipSource = {
+  name: string;
+  size: number;
+  open: () => AsyncIterable<Buffer | Uint8Array>;
+};
+
 export async function writeStoredZip(output: Writable, files: ZipEntry[]): Promise<void> {
+  await writeZipFromSources(output, files.map((file) => ({
+    name: file.name,
+    size: file.size,
+    open: () => createReadStream(file.filePath),
+  })));
+}
+
+export async function writeZipFromSources(output: Writable, files: ZipSource[]): Promise<void> {
   const now = dosDateTime(new Date());
   const central: Buffer[] = [];
   let offset = 0;
@@ -52,15 +66,17 @@ export async function writeStoredZip(output: Writable, files: ZipEntry[]): Promi
 
     let crc = 0xffffffff;
     let seen = 0;
-    const stream = createReadStream(file.filePath);
-    for await (const piece of stream) {
-      const chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
+    for await (const piece of file.open()) {
+      let chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
+      if (seen + chunk.length > file.size) chunk = chunk.subarray(0, file.size - seen);
+      if (chunk.length === 0) break;
       crc = updateCrc(crc, chunk);
       seen += chunk.length;
       await writeChunk(output, chunk);
+      if (seen === file.size) break;
     }
     if (seen !== file.size) {
-      throw Object.assign(new Error('The stored file changed while it was being packed.'), { code: 'EBUSY' });
+      throw Object.assign(new Error('The shared file changed while it was being packed.'), { code: 'EBUSY' });
     }
     const finished = (crc ^ 0xffffffff) >>> 0;
     const descriptor = Buffer.alloc(16);
