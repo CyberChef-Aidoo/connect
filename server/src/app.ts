@@ -61,6 +61,8 @@ import {
 } from './catalog.js';
 import { formatBytes } from './format.js';
 import { createPeerHub } from './peers.js';
+import { registerShareRoutes } from './shareHttp.js';
+import { createShareHub } from './shares.js';
 import { scheduleThumbnail } from './jobs.js';
 import { imageContentType, previewKind, readTextSample, TEXT_PREVIEW_MAX_BYTES } from './preview.js';
 import { hashPassword, passwordProblem, verifyPassword } from './passwords.js';
@@ -117,6 +119,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   const dummyHash = await hashPassword('not-a-real-password', passwordCost);
   const slots = new UploadSlots(config.maxUploadsPerUser, config.maxUploadsGlobal);
   const peers = createPeerHub();
+  const shareHub = createShareHub(config.maxFileBytes);
   const limits = publicLimits(config);
 
   const app = express();
@@ -144,6 +147,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
+  app.use('/api/shares', express.json({ limit: '512kb' }));
   app.use(express.json({ limit: '20kb' }));
   app.use(session({
     name: 'portal.sid',
@@ -208,10 +212,18 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     })().catch(next);
   });
 
-  app.post('/api/peers/heartbeat', requireAuth, requireCsrf, (req, res) => {
-    peers.beat(req.session.userId!);
-    res.json({ ok: true });
+  app.post('/api/peers/heartbeat', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
+      peers.beat(req.session.userId!);
+      const peerId = await ensurePeerId(req);
+      shareHub.beat(peerId, req.body?.displayName);
+      res.json({ ok: true, peerId });
+    } catch (error) {
+      next(error);
+    }
   });
+
+  registerShareRoutes(app, shareHub, requireAuth, requireCsrf, ensurePeerId);
 
   app.get('/api/peers', requireAuth, (req, res) => {
     res.json({ online: peers.onlineIds() });
@@ -750,6 +762,14 @@ function regenerateSession(req: Request): Promise<void> {
   return new Promise((resolve, reject) => {
     req.session.regenerate((error) => (error ? reject(error) : resolve()));
   });
+}
+
+async function ensurePeerId(req: Request): Promise<string> {
+  if (!req.session.peerId) {
+    req.session.peerId = randomUUID();
+    await saveSession(req);
+  }
+  return req.session.peerId;
 }
 
 function saveSession(req: Request): Promise<void> {
