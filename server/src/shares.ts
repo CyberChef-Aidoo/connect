@@ -199,7 +199,7 @@ export function createShareHub(maxFileBytes: number) {
       }));
   }
 
-  function takeBytes(jobId: string, fileId: string, ownerPeerId: string): PassThrough | { error: string } {
+  function takeBytes(jobId: string, fileId: string, ownerPeerId: string): { stream: PassThrough; size: number } | { error: string } {
     const job = jobs.get(jobId);
     if (!job || job.cancelled || job.ownerPeerId !== ownerPeerId) return { error: 'That download is no longer waiting.' };
     const expected = job.files[job.cursor];
@@ -211,7 +211,7 @@ export function createShareHub(maxFileBytes: number) {
     job.rejecter = null;
     job.cursor += 1;
     resolve(stream);
-    return stream;
+    return { stream, size: expected.size };
   }
 
   function waitForFile(job: Job, fileId: string): Promise<PassThrough> {
