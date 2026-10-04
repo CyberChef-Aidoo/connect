@@ -46,6 +46,8 @@ export function createShareHub(maxFileBytes: number) {
   const people = new Map<string, Person>();
   const shares = new Map<string, ShareRecord>();
   const jobs = new Map<string, Job>();
+  const transfers = new Map<string, ShareTransfer>();
+  const signals = new Map<string, ShareSignal[]>();
 
   function beat(peerId: string, displayName: unknown, now = Date.now()): void {
     people.set(peerId, { peerId, displayName: sanitizeDisplayName(displayName), seenAt: now });
@@ -78,7 +80,7 @@ export function createShareHub(maxFileBytes: number) {
     name: unknown;
     peerIds: unknown;
     files: unknown;
-  }, now = Date.now()): { ok: true; share: ShareView } | { ok: false; status: number; error: string } {
+  }, now = Date.now()) {
     const name = sanitizeShareName(input.name);
     if (!name) return { ok: false, status: 400, error: 'Name this share.' };
     const prepared = prepareShareFiles(input.files, MAX_FILES, maxFileBytes);
@@ -104,7 +106,7 @@ export function createShareHub(maxFileBytes: number) {
       allowed,
     };
     shares.set(share.id, share);
-    return { ok: true, share: view(share, input.ownerPeerId, now) };
+    return { ok: true, share: view(share, input.ownerPeerId, now), files: prepared.files };
   }
 
   function release(ownerPeerId: string): void {
@@ -196,6 +198,7 @@ export function createShareHub(maxFileBytes: number) {
           size: file.size,
         })),
         nextFileId: job.files[job.cursor]?.id ?? null,
+        ready: job.waiter !== null,
       }));
   }
 
@@ -314,6 +317,68 @@ export function createShareHub(maxFileBytes: number) {
     }
   }
 
+  function postSignal(input: {
+    fromPeerId: string;
+    shareId: string;
+    fileId: string;
+    toPeerId: string;
+    kind: string;
+    transferId?: string;
+    payload: unknown;
+  }, now = Date.now()): { ok: true; transferId: string } | { ok: false; status: number; error: string } {
+    const share = shares.get(input.shareId);
+    const file = share?.files.find((item) => item.id === input.fileId);
+    if (!share || !file || share.revoked) return { ok: false, status: 404, error: 'That shared file is not available.' };
+    const kind = input.kind;
+    const payload = typeof input.payload === 'string' ? input.payload.slice(0, 12_000) : '';
+    if (typeof input.payload === 'string' && input.payload.length > 12_000) {
+      return { ok: false, status: 400, error: 'That direct-send message is too large.' };
+    }
+    if (kind === 'request') {
+      if (input.fromPeerId === share.ownerPeerId || !share.allowed.has(input.fromPeerId) || input.toPeerId !== share.ownerPeerId) {
+        return { ok: false, status: 403, error: 'You cannot ask for this file.' };
+      }
+      if (now - share.lastSeen > ONLINE_MS) return { ok: false, status: 409, error: 'That person is not here.' };
+      const transfer = {
+        id: crypto.randomUUID(),
+        shareId: share.id,
+        fileId: file.id,
+        ownerPeerId: share.ownerPeerId,
+        peerId: input.fromPeerId,
+        expiresAt: now + 2 * 60_000,
+      };
+      transfers.set(transfer.id, transfer);
+      deliver(input.toPeerId, { ...transferFields(transfer), fromPeerId: input.fromPeerId, toPeerId: input.toPeerId, kind, payload });
+      return { ok: true, transferId: transfer.id };
+    }
+    const transfer = transfers.get(input.transferId ?? '');
+    if (!transfer || transfer.expiresAt <= now || transfer.fileId !== file.id) {
+      return { ok: false, status: 404, error: 'That direct send is no longer open.' };
+    }
+    const fromOwner = input.fromPeerId === transfer.ownerPeerId;
+    const fromPeer = input.fromPeerId === transfer.peerId;
+    const other = fromOwner ? transfer.peerId : transfer.ownerPeerId;
+    if ((!fromOwner && !fromPeer) || input.toPeerId !== other) {
+      return { ok: false, status: 403, error: 'That direct send is for someone else.' };
+    }
+    if ((kind === 'offer' || kind === 'reject') && !fromOwner) return { ok: false, status: 403, error: 'Only the sender can offer this file.' };
+    if (kind === 'answer' && !fromPeer) return { ok: false, status: 403, error: 'Only the receiver can answer.' };
+    deliver(input.toPeerId, { ...transferFields(transfer), fromPeerId: input.fromPeerId, toPeerId: input.toPeerId, kind, payload });
+    return { ok: true, transferId: transfer.id };
+  }
+
+  function takeSignals(peerId: string) {
+    const queued = signals.get(peerId) ?? [];
+    signals.delete(peerId);
+    return queued;
+  }
+
+  function deliver(peerId: string, signal: ShareSignal): void {
+    const queued = signals.get(peerId) ?? [];
+    queued.push(signal);
+    signals.set(peerId, queued.slice(-40));
+  }
+
   return {
     beat,
     online,
@@ -331,7 +396,32 @@ export function createShareHub(maxFileBytes: number) {
     waitForFile,
     cancelDownload,
     finish,
+    postSignal,
+    takeSignals,
   };
+}
+
+type ShareTransfer = {
+  id: string;
+  shareId: string;
+  fileId: string;
+  ownerPeerId: string;
+  peerId: string;
+  expiresAt: number;
+};
+
+type ShareSignal = {
+  transferId: string;
+  shareId: string;
+  fileId: string;
+  fromPeerId: string;
+  toPeerId: string;
+  kind: string;
+  payload: string;
+};
+
+function transferFields(transfer: ShareTransfer): Pick<ShareSignal, 'transferId' | 'shareId' | 'fileId'> {
+  return { transferId: transfer.id, shareId: transfer.shareId, fileId: transfer.fileId };
 }
 
 export type ShareHub = ReturnType<typeof createShareHub>;

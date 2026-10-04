@@ -6,7 +6,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "node --expose-gc --import tsx --test test/portal.test.ts",
+    "test": "node --expose-gc --import tsx --test test/portal.test.ts test/shares.test.ts",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "create-user": "tsx src/create-user.ts"
   },

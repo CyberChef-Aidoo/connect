@@ -47,11 +47,10 @@ export function registerShareRoutes(
         files: req.body?.files,
       });
       if (!published.ok) {
-        res.status(published.status).json({ error: published.error });
+        res.status(published.status ?? 400).json({ error: published.error ?? 'The share could not be published.' });
         return;
       }
-      const prepared = hub.preview(req.body?.files);
-      res.status(201).json({ share: published.share, files: prepared.files });
+      res.status(201).json({ share: published.share, files: published.files });
     } catch (error) {
       next(error);
     }
@@ -106,6 +105,35 @@ export function registerShareRoutes(
     }
   });
 
+  app.get('/api/share-signals', requireAuth, async (req, res, next) => {
+    try {
+      res.json({ signals: hub.takeSignals(await peerIdFor(req)) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post('/api/share-signals', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
+      const result = hub.postSignal({
+        fromPeerId: await peerIdFor(req),
+        shareId: typeof req.body?.shareId === 'string' ? req.body.shareId : '',
+        fileId: typeof req.body?.fileId === 'string' ? req.body.fileId : '',
+        toPeerId: typeof req.body?.toPeerId === 'string' ? req.body.toPeerId : '',
+        kind: typeof req.body?.kind === 'string' ? req.body.kind : '',
+        transferId: typeof req.body?.transferId === 'string' ? req.body.transferId : undefined,
+        payload: req.body?.payload,
+      });
+      if (!result.ok) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      res.json({ transferId: result.transferId });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get('/api/shares', requireAuth, async (req, res, next) => {
     try {
       res.json({ shares: hub.list(await peerIdFor(req)) });
@@ -133,7 +161,7 @@ export function registerShareRoutes(
     try {
       const started = hub.beginFile(routeParam(req, 'id'), routeParam(req, 'fileId'), await peerIdFor(req));
       if ('error' in started) {
-        sendShareError(res, started.error);
+        sendShareError(res, started.error ?? 'missing');
         return;
       }
       const downloadName = started.file.relativePath.split('/').pop() ?? 'download';
@@ -151,7 +179,7 @@ export function registerShareRoutes(
       const ids = typeof req.query.ids === 'string' && req.query.ids ? req.query.ids.split(',') : [];
       const started = hub.beginZip(routeParam(req, 'id'), req.query.dir, ids, await peerIdFor(req));
       if ('error' in started) {
-        sendShareError(res, started.error);
+        sendShareError(res, started.error ?? 'missing');
         return;
       }
       const folder = typeof req.query.dir === 'string' ? req.query.dir : '';
