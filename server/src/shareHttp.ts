@@ -17,7 +17,7 @@ export function registerShareRoutes(
   app.get('/api/share-peers', requireAuth, async (req, res, next) => {
     try {
       const self = await peerIdFor(req);
-      hub.beat(self, req.query.name);
+      hub.beat(self, typeof req.query.name === 'string' ? req.query.name : undefined);
       const people = hub.online()
         .filter((person) => person.peerId !== self)
         .map((person) => ({ peerId: person.peerId, displayName: person.displayName }));
@@ -239,17 +239,17 @@ async function pumpDownload(
   open: () => Promise<AsyncIterable<Buffer | Uint8Array>>,
   stop: () => void,
 ): Promise<void> {
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Disposition', attachmentDisposition(downloadName));
-  res.setHeader('Content-Length', String(size));
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Cache-Control', 'private, no-store');
-  res.setHeader('X-Transfer-Mode', 'relay');
   req.on('close', () => {
     if (!res.writableEnded) stop();
   });
   try {
     const stream = await open();
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', attachmentDisposition(downloadName));
+    res.setHeader('Content-Length', String(size));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Transfer-Mode', 'relay');
     let seen = 0;
     for await (const piece of stream) {
       const chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);

@@ -243,6 +243,7 @@ npm run create-user -- username
 6. Replace is offered only for a file you uploaded. The previous bytes stay available as an earlier version until you remove that version or the file leaves the portal. Uploading the same name again does not replace anything. Preview is offered for a picture within 8 MB and for a text file. The picture also appears as a thumbnail. A text preview shows at most the first 256 KB. HTML and SVG stay as downloads, so a page or script in the portal cannot run. PDF, audio, and video stay as downloads. Delete is offered only for files you uploaded. The server checks that again; hiding the button is not the only check. Delete moves the file to your bin for 30 days. Restore puts it back in the same folder, or at the top level if that folder was deleted. Delete permanently removes it. The bin still counts toward the 50 GB limit. Another person cannot see or restore your bin.
 7. Direct appears on someone else’s file when that person has the portal open. It asks their browser to send the file straight to yours. That works only for a file they uploaded during this visit, before they reload, and only up to 256 MB. Otherwise use Download. The direct path uses this computer only to pass the connection details. It does not use a public address-lookup service, so it stays on the local network. Download always uses the copy stored on this computer.
 8. The bar at the top shows how much of the 50 GB is in use, including unfinished uploads, the bin, and earlier versions.
+9. Share is a separate, read-only way to hand files to people who have the portal open. It does not put those files into the library. Share files picks one or more files. Share folder appears when the browser can select a directory; otherwise use Share files. The preview lists the relative paths that will be published. Absolute paths stay on your computer. A name such as `..` is refused, and two files that differ only by letter case get distinct names. Empty folders may be missing because the browser does not include them. The share is that selection, not a folder that is watched for later changes. Tick the people who may download, then publish. Keep this browser tab open. Reloading asks you to select the files again. Revoke stops new downloads. A copy someone already saved cannot be recalled. When their tab closes, the share is marked unavailable. Direct download is offered for a single file of 32 MB or less when the browser can open a direct connection. Download through this computer is the fallback: this PC streams the bytes, including a folder zip, and does not keep that zip. The browser’s own download list shows progress for that fallback, and canceling it stops the transfer. There is no remote editing, deleting, or two-way sync.
 
 An empty list, a loading line, a success note, and the server’s error text are shown on the page. A file that is too large, a full portal, a full disk, or a lost connection is reported as a failed upload and is not added to the list.
 
@@ -294,6 +295,19 @@ All `/api` routes require a signed-in session except `POST /api/auth/login`.
 | `GET` | `/api/peers` | User ids of people who are present. It does not include addresses. |
 | `POST` | `/api/signals` | Passes one direct-send message (`request`, `offer`, `answer`, `ice`, or `reject`). The body is connection data, never file bytes. A request goes to the uploader, and only the two people in that transfer can continue it. Requires `X-CSRF-Token`. |
 | `GET` | `/api/signals` | Takes the signed-in person’s waiting direct-send messages. |
+| `GET` | `/api/share-peers?name=` | People who have the portal open, other than you. `name` is the name shown for this browser. |
+| `POST` | `/api/shares/preview` | Checks paths and sizes before publishing. Returns the relative paths that would be shared. Requires `X-CSRF-Token`. |
+| `POST` | `/api/shares` | Publishes that selection for the chosen people. Requires `X-CSRF-Token`. |
+| `POST` | `/api/shares/release` | Drops every share from this browser. Requires `X-CSRF-Token`. |
+| `GET` | `/api/shares` | Shares you published and shares others allowed you to see. |
+| `GET` | `/api/shares/:id?dir=&q=` | One folder of a share, or a search of its relative paths. |
+| `DELETE` | `/api/shares/:id` | Revokes a share you published. New downloads are refused. Requires `X-CSRF-Token`. |
+| `GET` | `/api/shares/:id/files/:fileId` | Streams one shared file through this computer. The header `X-Transfer-Mode: relay` marks that fallback. |
+| `GET` | `/api/shares/:id/archive?dir=&ids=` | Streams a zip of one folder, or of the listed files, through this computer. The zip is not stored. |
+| `GET` | `/api/shares/outbox` | Files this browser still has to send for a download that is in progress. |
+| `POST` | `/api/shares/outbox/:jobId/files/:fileId` | Sends the next requested file. The size must match the published file. Requires `X-CSRF-Token`. |
+| `POST` | `/api/share-signals` | Passes one direct-download message for a shared file. Requires `X-CSRF-Token`. |
+| `GET` | `/api/share-signals` | Takes this browser’s waiting direct-download messages. |
 
 The cookie is `HttpOnly` and `SameSite=Strict`. On HTTPS it is also `Secure`. State-changing requests must send the CSRF token from the login or session response.
 

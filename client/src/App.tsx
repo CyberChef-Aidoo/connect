@@ -47,6 +47,7 @@ import {
   type UploadSession,
 } from './api';
 import { createDirectHub } from './directSend';
+import { ShareDesk } from './ShareDesk';
 import { folderPlacement, readDataTransfer, type PlannedUpload } from './folderUpload';
 import { rememberLocalFile } from './localFiles';
 import { formatBytes, formatWhen } from './format';
@@ -238,6 +239,7 @@ function Dashboard({
   const [binDays, setBinDays] = useState(30);
   const [online, setOnline] = useState<string[]>([]);
   const [takingId, setTakingId] = useState<string | null>(null);
+  const [desk, setDesk] = useState<'share' | 'library'>('share');
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
   const direct = useRef(createDirectHub());
   const started = useRef(new Set<string>());
@@ -890,6 +892,13 @@ function Dashboard({
         </div>
       </header>
 
+      <div className="view-toggle section-toggle" role="tablist" aria-label="Sections">
+        <button type="button" role="tab" aria-selected={desk === 'share'} onClick={() => setDesk('share')}>Share</button>
+        <button type="button" role="tab" aria-selected={desk === 'library'} onClick={() => setDesk('library')}>Library</button>
+      </div>
+      <ShareDesk csrf={csrf} hidden={desk !== 'share'} />
+      <div hidden={desk !== 'library'}>
+
       <section className="storage" aria-label="Storage">
         <div className="storage-copy">
           <strong>{storage ? `${formatBytes(storage.usedBytes)} of ${formatBytes(storage.limitBytes)} used` : 'Checking storage…'}</strong>
@@ -1090,6 +1099,7 @@ function Dashboard({
           </>
         )}
       </section>
+      </div>
     </div>
   );
 }

@@ -108,7 +108,10 @@ export async function browseShare(id: string, dir: string, query: string): Promi
 }
 
 export async function listSharePeers(): Promise<{ self: string; people: SharePerson[] }> {
-  const response = await fetch('/api/share-peers', { credentials: 'same-origin' });
+  const params = new URLSearchParams();
+  const name = typeof localStorage === 'undefined' ? '' : (localStorage.getItem('portal-share-name') || '');
+  if (name) params.set('name', name);
+  const response = await fetch(`/api/share-peers?${params}`, { credentials: 'same-origin' });
   return readJson(response);
 }
 
@@ -127,6 +130,39 @@ export function relayZipUrl(shareId: string, dir: string, ids: string[] = []): s
   if (dir) params.set('dir', dir);
   if (ids.length > 0) params.set('ids', ids.join(','));
   return `/api/shares/${encodeURIComponent(shareId)}/archive?${params}`;
+}
+
+export type ShareSignal = {
+  transferId: string;
+  shareId: string;
+  fileId: string;
+  fromPeerId: string;
+  toPeerId: string;
+  kind: string;
+  payload: string;
+};
+
+export async function postShareSignal(body: {
+  shareId: string;
+  fileId: string;
+  toPeerId: string;
+  kind: string;
+  transferId?: string;
+  payload: string;
+}, csrf: string): Promise<{ transferId: string }> {
+  const response = await fetch('/api/share-signals', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    body: JSON.stringify(body),
+  });
+  return readJson(response);
+}
+
+export async function takeShareSignals(): Promise<ShareSignal[]> {
+  const response = await fetch('/api/share-signals', { credentials: 'same-origin' });
+  const body = await readJson<{ signals: ShareSignal[] }>(response);
+  return body.signals;
 }
 
 export async function sendSharedBytes(jobId: string, fileId: string, file: File, csrf: string): Promise<void> {

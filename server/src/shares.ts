@@ -50,7 +50,11 @@ export function createShareHub(maxFileBytes: number) {
   const signals = new Map<string, ShareSignal[]>();
 
   function beat(peerId: string, displayName: unknown, now = Date.now()): void {
-    people.set(peerId, { peerId, displayName: sanitizeDisplayName(displayName), seenAt: now });
+    const previous = people.get(peerId);
+    const name = typeof displayName === 'string'
+      ? sanitizeDisplayName(displayName)
+      : previous?.displayName ?? 'This browser';
+    people.set(peerId, { peerId, displayName: name, seenAt: now });
     for (const share of shares.values()) {
       if (share.ownerPeerId === peerId && share.held && !share.revoked) share.lastSeen = now;
     }

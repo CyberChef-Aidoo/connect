@@ -118,6 +118,63 @@ describe('read-only shares', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('streams a folder zip without writing the archive, and revoke stops a download in progress', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-share-zip-'));
+    const handle = await createApp(testConfig(dir), { passwordCost: 4 });
+    const server = http.createServer(handle.app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const ada = await signIn(base, 'Ada');
+      const blake = await signIn(base, 'Blake');
+      const shared = await send(base, ada, '/api/shares', {
+        name: 'Docs',
+        peerIds: [blake.peerId],
+        files: [
+          { clientToken: 'a', relativePath: 'docs/a.txt', size: 3, modifiedAt: 1 },
+          { clientToken: 'b', relativePath: 'docs/b.txt', size: 3, modifiedAt: 1 },
+        ],
+      });
+      assert.equal(shared.status, 201);
+      const shareId = shared.body.share.id as string;
+      const [first, second] = shared.body.files as Array<{ id: string }>;
+      const download = get(base, blake, `/api/shares/${shareId}/archive?dir=${encodeURIComponent('docs')}`);
+      await postReadyFile(base, ada, first.id, 'one');
+      await postReadyFile(base, ada, second.id, 'two');
+      const received = await download;
+      assert.equal(received.status, 200);
+      assert.equal(received.headers.get('x-transfer-mode'), 'relay');
+      const bytes = Buffer.from(await received.arrayBuffer());
+      assert.equal(bytes.subarray(0, 2).toString(), 'PK');
+      assert.equal(bytes.includes(Buffer.from('one')), true);
+      assert.equal(bytes.includes(Buffer.from('two')), true);
+
+      const again = await send(base, ada, '/api/shares', {
+        name: 'One',
+        peerIds: [blake.peerId],
+        files: [{ clientToken: 'c', relativePath: 'note.txt', size: 4, modifiedAt: 1 }],
+      });
+      const fileId = again.body.files[0].id as string;
+      const hanging = get(base, blake, `/api/shares/${again.body.share.id}/files/${fileId}`);
+      await waitForReady(base, ada, fileId);
+      const revoked = await fetch(`${base}/api/shares/${again.body.share.id}`, {
+        method: 'DELETE',
+        headers: { Cookie: ada.cookie, 'X-CSRF-Token': ada.csrf },
+      });
+      assert.equal(revoked.status, 200);
+      const stopped = await hanging;
+      assert.equal(stopped.status, 502);
+      const names = await readdir(handle.config.storageDir);
+      assert.deepEqual(names.sort(), ['objects', 'thumbs', 'tmp']);
+    } finally {
+      server.close();
+      handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 async function signIn(base: string, displayName: string) {
@@ -147,13 +204,32 @@ async function get(base: string, who: { cookie: string }, pathName: string) {
 }
 
 async function waitForJob(base: string, who: { cookie: string }) {
+  return waitForReady(base, who);
+}
+
+async function waitForReady(base: string, who: { cookie: string }, fileId?: string) {
   const started = Date.now();
   while (Date.now() - started < 3000) {
     const response = await fetch(`${base}/api/shares/outbox`, { headers: { Cookie: who.cookie } });
-    const body = await response.json() as { jobs: Array<{ id: string; files: Array<{ fileId: string }> }> };
-    const ready = body.jobs.find((job) => (job as { ready?: boolean }).ready);
+    const body = await response.json() as { jobs: Array<{ id: string; nextFileId: string | null; ready?: boolean }> };
+    const ready = body.jobs.find((job) => job.ready && (!fileId || job.nextFileId === fileId));
     if (ready) return ready;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error('The sender never saw the download.');
+}
+
+async function postReadyFile(base: string, who: { cookie: string; csrf: string }, fileId: string, text: string) {
+  const job = await waitForReady(base, who, fileId);
+  const uploaded = await fetch(`${base}/api/shares/outbox/${job.id}/files/${fileId}`, {
+    method: 'POST',
+    headers: {
+      Cookie: who.cookie,
+      'X-CSRF-Token': who.csrf,
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(Buffer.byteLength(text)),
+    },
+    body: Buffer.from(text),
+  });
+  assert.equal(uploaded.status, 200);
 }
