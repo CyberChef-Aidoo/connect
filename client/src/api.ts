@@ -126,10 +126,12 @@ export async function login(username: string, password: string): Promise<Session
 }
 
 export async function heartbeat(csrfToken: string): Promise<void> {
+  const displayName = typeof localStorage === 'undefined' ? 'This browser' : (localStorage.getItem('portal-share-name') || 'This browser');
   const response = await fetch('/api/peers/heartbeat', {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { 'X-CSRF-Token': csrfToken },
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+    body: JSON.stringify({ displayName }),
   });
   await readJson(response);
 }
