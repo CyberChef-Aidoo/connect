@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { attachmentDisposition } from './storage.js';
 import type { ShareHub } from './shares.js';
 import type { TransferTracker } from './transferTrack.js';
-import { readProgressId, safeTransferName, writeChunks } from './transferTrack.js';
+import { readProgressId, writeChunks } from './transferTrack.js';
 import { writeZipFromSources } from './zip.js';
 
 type Guard = (req: Request, res: Response, next: NextFunction) => void;
@@ -209,7 +209,7 @@ export function registerShareRoutes(
       if (progressId) hub.attachProgress(started.job.id, progressId);
       await pumpDownload(req, res, started.file.size, downloadName, () => hub.waitForFile(started.job, started.file.id), () => {
         hub.cancelDownload(started.job.id);
-      }, (bytes) => tracker.add(progressId, 'sentBytes', bytes), progressId, tracker);
+      }, progressId, tracker);
       hub.finish(started.job.id);
     } catch (error) {
       next(error);
@@ -260,6 +260,8 @@ export function registerShareRoutes(
         }
       });
       try {
+        let lastHttp = 0;
+        let lastSource = 0;
         await writeZipFromSources(res, started.files.map((file) => ({
           name: zipEntryName(file.relativePath, folder),
           size: file.size,
@@ -313,9 +315,15 @@ async function pumpDownload(
   downloadName: string,
   open: () => Promise<AsyncIterable<Buffer | Uint8Array>>,
   stop: () => void,
+  progressId: string | null,
+  tracker: TransferTracker,
 ): Promise<void> {
+  let settled = false;
   req.on('close', () => {
-    if (!res.writableEnded) stop();
+    if (!res.writableEnded) {
+      stop();
+      if (!settled) tracker.fail(progressId, 'closed');
+    }
   });
   try {
     const stream = await open();
@@ -325,22 +333,43 @@ async function pumpDownload(
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Transfer-Mode', 'relay');
-    let seen = 0;
-    for await (const piece of stream) {
-      const chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
-      seen += chunk.length;
-      if (!res.write(chunk)) await once(res, 'drain');
-    }
+    const seen = await writeChunks(res, stream, (bytes) => tracker.add(progressId, 'sentBytes', bytes));
     if (seen !== size) throw new Error('The shared file ended early.');
     res.end();
+    settled = true;
+    tracker.finish(progressId);
   } catch (error) {
     stop();
+    if (!settled) tracker.fail(progressId, 'failed');
     const message = error instanceof Error && error.message.startsWith('The sender')
       ? error.message
       : 'The sender did not finish this file.';
     if (!res.headersSent) res.status(502).json({ error: message });
     else res.destroy();
   }
+}
+
+function openDownloadTrack(
+  req: Request,
+  res: Response,
+  tracker: TransferTracker,
+  input: { filename: string; kind: 'relay' | 'relay-zip'; totalBytes: number | null; sourceTotal: number | null },
+): string | null {
+  const id = readProgressId(req.query.progress);
+  const userId = req.session.userId;
+  if (!id || !userId) return null;
+  const opened = tracker.open({
+    id,
+    userId,
+    filename: input.filename,
+    kind: input.kind,
+    totalBytes: input.totalBytes,
+    sourceTotal: input.sourceTotal,
+    abort: () => {
+      if (!res.writableEnded) res.destroy();
+    },
+  });
+  return opened ? id : null;
 }
 
 function sendShareError(res: Response, error: string): void {
