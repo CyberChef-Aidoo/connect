@@ -1,16 +1,13 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+﻿import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import {
   addToCollection,
   ApiError,
   createCollection,
   createFolder,
   deleteCollection,
-  deleteFile,
   deleteFiles,
   deleteFolder,
-  deleteVersion,
   deleteUpload,
-  detachTag,
   ensureFolder,
   getSession,
   heartbeat,
@@ -20,17 +17,13 @@ import {
   listPeers,
   listTags,
   listUploads,
-  listVersions,
   login,
   logout,
   moveFiles,
   purgeFile,
-  removeFromCollection,
   renameCollection,
   renameFolder,
-  replaceFile,
   restoreFile,
-  setFavorite,
   tagFiles,
   takeSignals,
   uploadFile,
@@ -39,7 +32,6 @@ import {
   type Breadcrumb,
   type CollectionItem,
   type FileList,
-  type FileVersion,
   type FolderItem,
   type PortalFile,
   type Session,
@@ -52,6 +44,7 @@ import { ShareDesk } from './ShareDesk';
 import { folderPlacement, readDataTransfer, type PlannedUpload } from './folderUpload';
 import { rememberLocalFile } from './localFiles';
 import { formatBytes, formatWhen } from './format';
+import { FileCards, FileGrid, FileTable, LibraryToolbar, useMediaQuery } from './libraryView';
 import { selectionMatchesSession } from './resumeMatch';
 import { formatRemaining, formatSpeed, rememberSample, transferView, type TransferSample } from './transfer';
 
@@ -85,8 +78,8 @@ const PAGE_SIZE = 24;
 const SORTS: Array<{ value: SortValue; label: string }> = [
   { value: 'date:desc', label: 'Newest' },
   { value: 'date:asc', label: 'Oldest' },
-  { value: 'name:asc', label: 'Name A–Z' },
-  { value: 'name:desc', label: 'Name Z–A' },
+  { value: 'name:asc', label: 'Name Aâ€“Z' },
+  { value: 'name:desc', label: 'Name Zâ€“A' },
   { value: 'size:desc', label: 'Largest' },
   { value: 'size:asc', label: 'Smallest' },
 ];
@@ -113,7 +106,7 @@ export function App() {
     return (
       <main className="gate">
         <ThemeButton theme={theme} floating />
-        <p className="status" role="status">Checking your session…</p>
+        <p className="status" role="status">Checking your sessionâ€¦</p>
       </main>
     );
   }
@@ -193,7 +186,7 @@ function Login({ onSuccess, theme }: { onSuccess: (session: Session) => void; th
           onChange={(event) => setPassword(event.target.value)}
           required
         />
-        <button type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+        <button type="submit" disabled={busy}>{busy ? 'Signing inâ€¦' : 'Sign in'}</button>
       </form>
     </main>
   );
@@ -232,9 +225,8 @@ function Dashboard({
   const [tags, setTags] = useState<TagItem[]>([]);
   const [collections, setCollections] = useState<CollectionItem[]>([]);
   const [tagDraft, setTagDraft] = useState('');
-  const [collectionDraft, setCollectionDraft] = useState('');
+  const compactList = useMediaQuery('(max-width: 899px)');
   const [bulkCollectionId, setBulkCollectionId] = useState('');
-  const [collectionName, setCollectionName] = useState('');
   const [previewing, setPreviewing] = useState<PortalFile | null>(null);
   const [binOpen, setBinOpen] = useState(false);
   const [binFiles, setBinFiles] = useState<BinFile[]>([]);
@@ -678,8 +670,6 @@ function Dashboard({
 
   function chooseCollection(id: string) {
     setCollectionId(id);
-    const match = collections.find((item) => item.id === id);
-    setCollectionName(match?.name ?? '');
     resetPage();
   }
 
@@ -791,28 +781,24 @@ function Dashboard({
     }
   }
 
-  async function makeCollection(event: FormEvent) {
-    event.preventDefault();
-    if (!collectionDraft.trim()) return;
+  async function makeCollection(name: string) {
+    if (!name.trim()) return;
     setListError('');
     try {
-      const created = await createCollection(collectionDraft, csrf);
-      setCollectionDraft('');
+      const created = await createCollection(name, csrf);
       setCollectionId(created.id);
-      setCollectionName(created.name);
       resetPage();
-      setBanner(`Collection “${created.name}” created.`);
+      setBanner(`Collection â€œ${created.name}â€ created.`);
     } catch (caught) {
       setListError(caught instanceof ApiError ? caught.message : 'The collection could not be created.');
     }
   }
 
-  async function saveCollectionName(event: FormEvent) {
-    event.preventDefault();
-    if (!collectionId || !collectionName.trim()) return;
+  async function saveCollectionName(name: string) {
+    if (!collectionId || !name.trim()) return;
     setListError('');
     try {
-      await renameCollection(collectionId, collectionName, csrf);
+      await renameCollection(collectionId, name, csrf);
       setBanner('Collection renamed.');
       await refresh();
     } catch (caught) {
@@ -826,7 +812,6 @@ function Dashboard({
     try {
       await deleteCollection(collectionId, csrf);
       setCollectionId('');
-      setCollectionName('');
       resetPage();
       setBanner('Collection deleted. The files are still in the portal.');
       await refresh();
@@ -884,6 +869,22 @@ function Dashboard({
     }
   }
 
+  const fileListProps = {
+    files: listing?.files ?? [],
+    loading,
+    searching: search.length > 0 || favoriteOnly || Boolean(tagId || collectionId),
+    hasFolders: !search && !favoriteOnly && !tagId && !collectionId && (listing?.folders?.length ?? 0) > 0,
+    selected,
+    collectionId,
+    onToggle: toggleSelected,
+    csrfToken: csrf,
+    onChanged: refresh,
+    onError: setListError,
+    onPreview: setPreviewing,
+    canDirect,
+    takingId,
+    onDirect: (file: PortalFile) => void takeDirect(file),
+  };
   const storage = listing?.storage;
   const ratio = storage && storage.limitBytes > 0 ? Math.min(1, storage.usedBytes / storage.limitBytes) : 0;
 
@@ -913,7 +914,7 @@ function Dashboard({
 
       <section className="storage" aria-label="Storage">
         <div className="storage-copy">
-          <strong>{storage ? `${formatBytes(storage.usedBytes)} of ${formatBytes(storage.limitBytes)} used` : 'Checking storage…'}</strong>
+          <strong>{storage ? `${formatBytes(storage.usedBytes)} of ${formatBytes(storage.limitBytes)} used` : 'Checking storageâ€¦'}</strong>
           <span>Up to {formatBytes(session.limits.maxFileBytes)} per file</span>
         </div>
         <progress max={100} value={Math.round(ratio * 100)} className={ratio >= 0.9 ? 'tight' : undefined} />
@@ -944,8 +945,8 @@ function Dashboard({
       {banner ? <p className="banner ok" role="status">{banner}</p> : null}
       {listError ? <p className="banner error" role="alert">{listError}</p> : null}
 
-      <section className="panel">
-        <p className="meta">Direct asks the uploader’s open browser to send the file on this network. Download uses the copy stored on this computer. A direct send works only while that person still has the file from an upload in this visit, and only for files up to 256 MB.</p>
+      <section className="panel library">
+        <p className="meta">Direct asks the uploaderâ€™s open browser to send the file on this network. Download uses the copy stored on this computer. A direct send works only while that person still has the file from an upload in this visit, and only for files up to 256 MB.</p>
         <FolderBar
           breadcrumbs={listing?.breadcrumbs ?? []}
           draft={folderDraft}
@@ -988,62 +989,29 @@ function Dashboard({
             </div>
           </div>
         ) : null}
-        <div className="toolbar">
-          <label>
-            Search
-            <input
-              type="search"
-              value={searchInput}
-              placeholder="Filename in every folder"
-              onChange={(event) => setSearchInput(event.target.value)}
-            />
-          </label>
-          <label>
-            Sort
-            <select value={sort} onChange={(event) => changeSort(event.target.value as SortValue)}>
-              {SORTS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <button type="button" className="ghost" aria-pressed={favoriteOnly} onClick={() => chooseFavorite(!favoriteOnly)}>Favorites</button>
-          <button type="button" className="ghost" aria-pressed={binOpen} onClick={() => setBinOpen((open) => !open)}>Bin</button>
-          <label>
-            Tag
-            <select value={tagId} onChange={(event) => chooseTag(event.target.value)}>
-              <option value="">Every file</option>
-              {tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}
-            </select>
-          </label>
-          <label>
-            Collection
-            <select value={collectionId} onChange={(event) => chooseCollection(event.target.value)}>
-              <option value="">Every file</option>
-              {collections.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-          </label>
-          <form className="inline-rename" onSubmit={(event) => void makeCollection(event)}>
-            <label>
-              New collection
-              <input value={collectionDraft} onChange={(event) => setCollectionDraft(event.target.value)} />
-            </label>
-            <button type="submit">Create</button>
-          </form>
-          {collections.find((item) => item.id === collectionId)?.canRename ? (
-            <form className="inline-rename" onSubmit={(event) => void saveCollectionName(event)}>
-              <label>
-                Rename collection
-                <input value={collectionName} onChange={(event) => setCollectionName(event.target.value)} />
-              </label>
-              <button type="submit">Save</button>
-            </form>
-          ) : null}
-          {collections.find((item) => item.id === collectionId)?.canDelete ? (
-            <button type="button" className="ghost danger" onClick={() => void removeCollection()}>Delete collection</button>
-          ) : null}
-          <div className="view-toggle" role="group" aria-label="Layout">
-            <button type="button" className="ghost" aria-pressed={view === 'list'} onClick={() => chooseView('list')}>List</button>
-            <button type="button" className="ghost" aria-pressed={view === 'grid'} onClick={() => chooseView('grid')}>Grid</button>
-          </div>
-        </div>
+        <LibraryToolbar
+          favoriteOnly={favoriteOnly}
+          binOpen={binOpen}
+          view={view}
+          sort={sort}
+          sorts={SORTS}
+          searchInput={searchInput}
+          tagId={tagId}
+          collectionId={collectionId}
+          tags={tags}
+          collections={collections}
+          onSearch={setSearchInput}
+          onSort={(value) => changeSort(value as SortValue)}
+          onAll={() => { setBinOpen(false); chooseFavorite(false); }}
+          onFavorites={() => { setBinOpen(false); chooseFavorite(true); }}
+          onBin={() => { setFavoriteOnly(false); setBinOpen(true); }}
+          onView={chooseView}
+          onTag={chooseTag}
+          onCollection={chooseCollection}
+          onCreateCollection={makeCollection}
+          onRenameCollection={saveCollectionName}
+          onDeleteCollection={removeCollection}
+        />
         <datalist id="portal-tags">
           {tags.map((tag) => <option key={tag.id} value={tag.name} />)}
         </datalist>
@@ -1068,40 +1036,11 @@ function Dashboard({
           onError={setListError}
         />
         {view === 'grid' ? (
-          <FileGrid
-            files={listing?.files ?? []}
-            loading={loading}
-            searching={search.length > 0 || favoriteOnly || Boolean(tagId || collectionId)}
-            hasFolders={!search && !favoriteOnly && !tagId && !collectionId && (listing?.folders?.length ?? 0) > 0}
-            selected={selected}
-            collectionId={collectionId}
-            onToggle={toggleSelected}
-            csrfToken={csrf}
-            onChanged={refresh}
-            onError={setListError}
-            onPreview={setPreviewing}
-            canDirect={canDirect}
-            takingId={takingId}
-            onDirect={(file) => void takeDirect(file)}
-          />
+          <FileGrid {...fileListProps} />
+        ) : compactList ? (
+          <FileCards {...fileListProps} onTogglePage={togglePage} />
         ) : (
-          <FileTable
-            files={listing?.files ?? []}
-            loading={loading}
-            searching={search.length > 0 || favoriteOnly || Boolean(tagId || collectionId)}
-            hasFolders={!search && !favoriteOnly && !tagId && !collectionId && (listing?.folders?.length ?? 0) > 0}
-            selected={selected}
-            collectionId={collectionId}
-            onToggle={toggleSelected}
-            onTogglePage={togglePage}
-            csrfToken={csrf}
-            onChanged={refresh}
-            onError={setListError}
-            onPreview={setPreviewing}
-            canDirect={canDirect}
-            takingId={takingId}
-            onDirect={(file) => void takeDirect(file)}
-          />
+          <FileTable {...fileListProps} onTogglePage={togglePage} />
         )}
         <PreviewDialog file={previewing} onClose={() => setPreviewing(null)} />
         <div className="pager">
@@ -1288,7 +1227,7 @@ function UploadZone({
                 : formatBytes(item.file.size);
               const detail = [amount, speed, remaining]
                 .filter(Boolean)
-                .join(' · ');
+                .join(' Â· ');
               return (
                 <li key={item.id}>
                   <div className="queue-row">
@@ -1464,450 +1403,6 @@ function FolderList({
   );
 }
 
-function FileTable({
-  files,
-  loading,
-  searching,
-  hasFolders,
-  selected,
-  collectionId,
-  onToggle,
-  onTogglePage,
-  csrfToken,
-  onChanged,
-  onError,
-  onPreview,
-  canDirect,
-  takingId,
-  onDirect,
-}: {
-  files: PortalFile[];
-  loading: boolean;
-  searching: boolean;
-  hasFolders: boolean;
-  selected: string[];
-  collectionId: string;
-  onToggle: (id: string, checked: boolean) => void;
-  onTogglePage: (ids: string[], checked: boolean) => void;
-  csrfToken: string;
-  onChanged: () => Promise<void>;
-  onError: (message: string) => void;
-  onPreview: (file: PortalFile) => void;
-  canDirect: (file: PortalFile) => boolean;
-  takingId: string | null;
-  onDirect: (file: PortalFile) => void;
-}) {
-  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<string | null>(null);
-
-  async function confirmDelete(file: PortalFile) {
-    setDeleting(file.id);
-    onError('');
-    try {
-      await deleteFile(file.id, csrfToken);
-      setPendingDelete(null);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The file could not be deleted.');
-    } finally {
-      setDeleting(null);
-    }
-  }
-
-  if (loading && files.length === 0) {
-    return <p className="status" role="status">Loading files…</p>;
-  }
-  if (!loading && files.length === 0) {
-    if (hasFolders) return <p className="status">No files in this folder.</p>;
-    return (
-      <p className="status">
-        {searching ? 'No files match.' : 'No files yet. Upload the first one.'}
-      </p>
-    );
-  }
-
-  return (
-    <div className="table-wrap">
-      <table className="files">
-        <caption>You can delete files you uploaded. Anyone signed in can download. Direct sends from the uploader’s open browser when they are here.</caption>
-        <thead>
-          <tr>
-            <th scope="col">
-              <input
-                type="checkbox"
-                aria-label="Select every file on this page"
-                checked={files.length > 0 && files.every((file) => selected.includes(file.id))}
-                onChange={(event) => onTogglePage(files.map((file) => file.id), event.target.checked)}
-              />
-            </th>
-            <th scope="col"><span className="sr">Favorite</span></th>
-            <th scope="col">Name</th>
-            <th scope="col">Size</th>
-            <th scope="col">Uploaded</th>
-            <th scope="col">By</th>
-            <th scope="col"><span className="sr">Actions</span></th>
-          </tr>
-        </thead>
-        <tbody>
-          {files.map((file) => (
-            <tr key={file.id}>
-              <td>
-                <input
-                  type="checkbox"
-                  aria-label={`Select ${file.originalName}`}
-                  checked={selected.includes(file.id)}
-                  onChange={(event) => onToggle(file.id, event.target.checked)}
-                />
-              </td>
-              <td>
-                <FileMarks
-                  file={file}
-                  collectionId={collectionId}
-                  csrfToken={csrfToken}
-                  onChanged={onChanged}
-                  onError={onError}
-                />
-              </td>
-              <td className="filename">
-                {file.preview === 'image' ? (
-                  <img className="thumb" alt="" src={`/api/files/${encodeURIComponent(file.id)}/thumbnail`} />
-                ) : null}
-                {file.originalName}
-                {searching && file.folderName ? <span className="meta"> In {file.folderName}</span> : null}
-              </td>
-              <td data-label="Size">{formatBytes(file.sizeBytes)}</td>
-              <td data-label="Uploaded">{formatWhen(file.createdAt)}</td>
-              <td data-label="By">{file.ownerUsername}</td>
-              <td className="actions" data-label="Actions">
-                {file.preview === 'image' || file.preview === 'text' ? (
-                  <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
-                ) : null}
-                <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
-                {canDirect(file) ? (
-                  <button type="button" className="ghost" disabled={takingId === file.id} onClick={() => onDirect(file)}>
-                    {takingId === file.id ? 'Receiving…' : 'Direct'}
-                  </button>
-                ) : null}
-                <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
-                {file.canDelete && pendingDelete !== file.id ? (
-                  <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
-                ) : null}
-                {file.canDelete && pendingDelete === file.id ? (
-                  <>
-                    <span>Move this file to the bin?</span>
-                    <button type="button" className="danger" disabled={deleting === file.id} onClick={() => void confirmDelete(file)}>
-                      {deleting === file.id ? 'Moving…' : 'Move to bin'}
-                    </button>
-                    <button type="button" className="ghost" onClick={() => setPendingDelete(null)}>Keep</button>
-                  </>
-                ) : null}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function FileGrid({
-  files,
-  loading,
-  searching,
-  hasFolders,
-  selected,
-  collectionId,
-  onToggle,
-  csrfToken,
-  onChanged,
-  onError,
-  onPreview,
-  canDirect,
-  takingId,
-  onDirect,
-}: {
-  files: PortalFile[];
-  loading: boolean;
-  searching: boolean;
-  hasFolders: boolean;
-  selected: string[];
-  collectionId: string;
-  onToggle: (id: string, checked: boolean) => void;
-  csrfToken: string;
-  onChanged: () => Promise<void>;
-  onError: (message: string) => void;
-  onPreview: (file: PortalFile) => void;
-  canDirect: (file: PortalFile) => boolean;
-  takingId: string | null;
-  onDirect: (file: PortalFile) => void;
-}) {
-  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<string | null>(null);
-
-  async function confirmDelete(file: PortalFile) {
-    setDeleting(file.id);
-    onError('');
-    try {
-      await deleteFile(file.id, csrfToken);
-      setPendingDelete(null);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The file could not be deleted.');
-    } finally {
-      setDeleting(null);
-    }
-  }
-
-  if (loading && files.length === 0) return <p className="status" role="status">Loading files…</p>;
-  if (!loading && files.length === 0) {
-    if (hasFolders) return <p className="status">No files in this folder.</p>;
-    return <p className="status">{searching ? 'No files match.' : 'No files yet. Upload the first one.'}</p>;
-  }
-
-  return (
-    <ul className="grid">
-      {files.map((file) => (
-        <li key={file.id} className="tile">
-          <label className="pick">
-            <input
-              type="checkbox"
-              aria-label={`Select ${file.originalName}`}
-              checked={selected.includes(file.id)}
-              onChange={(event) => onToggle(file.id, event.target.checked)}
-            />
-            Select
-          </label>
-          <FileMarks
-            file={file}
-            collectionId={collectionId}
-            csrfToken={csrfToken}
-            onChanged={onChanged}
-            onError={onError}
-          />
-          {file.preview === 'image' ? (
-            <img className="thumb" alt="" src={`/api/files/${encodeURIComponent(file.id)}/thumbnail`} />
-          ) : null}
-          <strong className="filename">{file.originalName}</strong>
-          <span className="meta">{formatBytes(file.sizeBytes)} · {file.ownerUsername}</span>
-          {searching && file.folderName ? <span className="meta">In {file.folderName}</span> : null}
-          <span className="meta">{formatWhen(file.createdAt)}</span>
-          <div className="actions">
-            {file.preview === 'image' || file.preview === 'text' ? (
-              <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
-            ) : null}
-            <FileHistory file={file} csrfToken={csrfToken} onChanged={onChanged} onError={onError} />
-            {canDirect(file) ? (
-              <button type="button" className="ghost" disabled={takingId === file.id} onClick={() => onDirect(file)}>
-                {takingId === file.id ? 'Receiving…' : 'Direct'}
-              </button>
-            ) : null}
-            <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
-            {file.canDelete && pendingDelete !== file.id ? (
-              <button type="button" className="ghost danger" onClick={() => setPendingDelete(file.id)}>Delete</button>
-            ) : null}
-            {file.canDelete && pendingDelete === file.id ? (
-              <button type="button" className="danger" disabled={deleting === file.id} onClick={() => void confirmDelete(file)}>
-                {deleting === file.id ? 'Moving…' : 'Move to bin'}
-              </button>
-            ) : null}
-          </div>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function FileMarks({
-  file,
-  collectionId,
-  csrfToken,
-  onChanged,
-  onError,
-}: {
-  file: PortalFile;
-  collectionId: string;
-  csrfToken: string;
-  onChanged: () => Promise<void>;
-  onError: (message: string) => void;
-}) {
-  const [draft, setDraft] = useState('');
-
-  async function star() {
-    onError('');
-    try {
-      await setFavorite(file.id, !file.favorite, csrfToken);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The favorite could not be saved.');
-    }
-  }
-
-  async function addTag(event: FormEvent) {
-    event.preventDefault();
-    if (!draft.trim()) return;
-    onError('');
-    try {
-      await tagFiles([file.id], draft, csrfToken);
-      setDraft('');
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The tag could not be saved.');
-    }
-  }
-
-  async function removeTag(id: string) {
-    onError('');
-    try {
-      await detachTag(file.id, id, csrfToken);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The tag could not be removed.');
-    }
-  }
-
-  async function leaveCollection() {
-    if (!collectionId) return;
-    onError('');
-    try {
-      await removeFromCollection(collectionId, file.id, csrfToken);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The file could not be removed from the collection.');
-    }
-  }
-
-  return (
-    <div className="marks">
-      <button
-        type="button"
-        className="ghost star"
-        aria-pressed={Boolean(file.favorite)}
-        aria-label={file.favorite ? `Remove ${file.originalName} from favorites` : `Add ${file.originalName} to favorites`}
-        onClick={() => void star()}
-      >
-        {file.favorite ? '★' : '☆'}
-      </button>
-      {(file.tags ?? []).map((tag) => (
-        <span key={tag.id} className="chip">
-          {tag.name}
-          <button type="button" className="ghost" aria-label={`Remove tag ${tag.name} from ${file.originalName}`} onClick={() => void removeTag(tag.id)}>×</button>
-        </span>
-      ))}
-      <form className="inline-rename" onSubmit={(event) => void addTag(event)}>
-        <label className="sr" htmlFor={`tag-${file.id}`}>Tag for {file.originalName}</label>
-        <input id={`tag-${file.id}`} list="portal-tags" value={draft} placeholder="Add tag" onChange={(event) => setDraft(event.target.value)} />
-      </form>
-      {collectionId ? (
-        <button type="button" className="ghost" onClick={() => void leaveCollection()}>Remove from collection</button>
-      ) : null}
-    </div>
-  );
-}
-
-function FileHistory({
-  file,
-  csrfToken,
-  onChanged,
-  onError,
-}: {
-  file: PortalFile;
-  csrfToken: string;
-  onChanged: () => Promise<void>;
-  onError: (message: string) => void;
-}) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [open, setOpen] = useState(false);
-  const [versions, setVersions] = useState<FileVersion[]>([]);
-  const [busy, setBusy] = useState(false);
-
-  async function chooseReplacement(chosen: globalThis.FileList | null) {
-    const next = chosen?.item(0);
-    if (!next) return;
-    setBusy(true);
-    onError('');
-    try {
-      await replaceFile(file.id, next, csrfToken);
-      setOpen(false);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The file could not be replaced.');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function showVersions() {
-    if (open) {
-      setOpen(false);
-      return;
-    }
-    onError('');
-    try {
-      const next = await listVersions(file.id);
-      setVersions(next.versions);
-      setOpen(true);
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The earlier versions could not be loaded.');
-    }
-  }
-
-  async function removeVersion(versionId: string) {
-    setBusy(true);
-    onError('');
-    try {
-      await deleteVersion(file.id, versionId, csrfToken);
-      const next = await listVersions(file.id);
-      setVersions(next.versions);
-      await onChanged();
-    } catch (caught) {
-      onError(caught instanceof ApiError ? caught.message : 'The version could not be removed.');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="history">
-      {file.canDelete ? (
-        <>
-          <button type="button" className="ghost" disabled={busy} onClick={() => inputRef.current?.click()}>
-            {busy ? 'Replacing…' : 'Replace'}
-          </button>
-          <input
-            ref={inputRef}
-            type="file"
-            aria-label={`Replace ${file.originalName}`}
-            onChange={(event) => {
-              const chosen = event.target.files;
-              event.target.value = '';
-              void chooseReplacement(chosen);
-            }}
-          />
-        </>
-      ) : null}
-      {(file.versionCount ?? 0) > 0 ? (
-        <button type="button" className="ghost" aria-expanded={open} onClick={() => void showVersions()}>
-          {file.versionCount === 1 ? '1 earlier version' : `${file.versionCount} earlier versions`}
-        </button>
-      ) : null}
-      {open ? (
-        <ul className="versions">
-          {versions.map((version) => (
-            <li key={version.id}>
-              <span>{version.originalName}</span>
-              <span className="meta">{formatBytes(version.sizeBytes)} · {formatWhen(version.createdAt)}</span>
-              <a href={`/api/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(version.id)}/download`}>Download</a>
-              {file.canDelete ? (
-                <button type="button" className="ghost danger" disabled={busy} onClick={() => void removeVersion(version.id)}>Remove</button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
-  );
-}
-
 function BinPanel({
   files,
   retentionDays,
@@ -1961,7 +1456,7 @@ function BinPanel({
           {files.map((file) => (
             <li key={file.id}>
               <span className="filename">{file.originalName}</span>
-              <span className="meta">{formatBytes(file.sizeBytes)} · {formatWhen(file.deletedAt)}</span>
+              <span className="meta">{formatBytes(file.sizeBytes)} Â· {formatWhen(file.deletedAt)}</span>
               <button type="button" disabled={busy === file.id} onClick={() => void restore(file)}>Restore</button>
               {pending !== file.id ? (
                 <button type="button" className="ghost danger" onClick={() => setPending(file.id)}>Delete permanently</button>
@@ -2049,7 +1544,7 @@ function PreviewDialog({
           {file.preview === 'image' ? (
             <img alt={file.originalName} src={`/api/files/${encodeURIComponent(file.id)}/preview`} />
           ) : null}
-          {file.preview === 'text' && loading ? <p className="status" role="status">Loading preview…</p> : null}
+          {file.preview === 'text' && loading ? <p className="status" role="status">Loading previewâ€¦</p> : null}
           {file.preview === 'text' && error ? <p className="banner error" role="alert">{error}</p> : null}
           {file.preview === 'text' && !error ? <pre>{text}</pre> : null}
           {truncated ? <p className="meta">Showing the first 256 KB. Download the file for the rest.</p> : null}
