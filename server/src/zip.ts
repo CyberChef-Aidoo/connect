@@ -37,17 +37,21 @@ export type ZipSource = {
   open: () => AsyncIterable<Buffer | Uint8Array>;
 };
 
-export async function writeStoredZip(output: Writable, files: ZipEntry[]): Promise<void> {
+export type ZipObserver = (event: { httpBytes: number; sourceBytes: number }) => void;
+
+export async function writeStoredZip(output: Writable, files: ZipEntry[], observe?: ZipObserver): Promise<void> {
   await writeZipFromSources(output, files.map((file) => ({
     name: file.name,
     size: file.size,
     open: () => createReadStream(file.filePath),
-  })));
+  })), observe);
 }
 
-export async function writeZipFromSources(output: Writable, files: ZipSource[]): Promise<void> {
+export async function writeZipFromSources(output: Writable, files: ZipSource[], observe?: ZipObserver): Promise<void> {
   const now = dosDateTime(new Date());
   const central: Buffer[] = [];
+  const tally = { http: 0, source: 0 };
+  const note = () => observe?.({ httpBytes: tally.http, sourceBytes: tally.source });
   let offset = 0;
   for (const file of files) {
     const name = Buffer.from(file.name, 'utf8');
@@ -59,8 +63,8 @@ export async function writeZipFromSources(output: Writable, files: ZipSource[]):
     local.writeUInt16LE(now.time, 10);
     local.writeUInt16LE(now.date, 12);
     local.writeUInt16LE(name.length, 26);
-    await writeChunk(output, local);
-    await writeChunk(output, name);
+    await writeCounted(output, local, tally, note);
+    await writeCounted(output, name, tally, note);
     const localOffset = offset;
     offset += local.length + name.length;
 
@@ -72,7 +76,8 @@ export async function writeZipFromSources(output: Writable, files: ZipSource[]):
       if (chunk.length === 0) break;
       crc = updateCrc(crc, chunk);
       seen += chunk.length;
-      await writeChunk(output, chunk);
+      tally.source += chunk.length;
+      await writeCounted(output, chunk, tally, note);
       if (seen === file.size) break;
     }
     if (seen !== file.size) {
@@ -84,7 +89,7 @@ export async function writeZipFromSources(output: Writable, files: ZipSource[]):
     descriptor.writeUInt32LE(finished, 4);
     descriptor.writeUInt32LE(seen, 8);
     descriptor.writeUInt32LE(seen, 12);
-    await writeChunk(output, descriptor);
+    await writeCounted(output, descriptor, tally, note);
     offset += seen + descriptor.length;
 
     const header = Buffer.alloc(46);
@@ -106,7 +111,7 @@ export async function writeZipFromSources(output: Writable, files: ZipSource[]):
   const centralOffset = offset;
   let centralSize = 0;
   for (const part of central) {
-    await writeChunk(output, part);
+    await writeCounted(output, part, tally, note);
     centralSize += part.length;
   }
   const end = Buffer.alloc(22);
@@ -115,7 +120,18 @@ export async function writeZipFromSources(output: Writable, files: ZipSource[]):
   end.writeUInt16LE(files.length, 10);
   end.writeUInt32LE(centralSize, 12);
   end.writeUInt32LE(centralOffset, 16);
-  await writeChunk(output, end);
+  await writeCounted(output, end, tally, note);
+}
+
+async function writeCounted(
+  output: Writable,
+  chunk: Buffer,
+  tally: { http: number },
+  note: () => void,
+): Promise<void> {
+  await writeChunk(output, chunk);
+  tally.http += chunk.length;
+  note();
 }
 
 function updateCrc(crc: number, chunk: Buffer): number {
