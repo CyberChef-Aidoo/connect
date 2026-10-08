@@ -54,6 +54,7 @@ export function createShareHub(maxFileBytes: number) {
     const name = typeof displayName === 'string'
       ? sanitizeDisplayName(displayName)
       : previous?.displayName ?? 'This browser';
+    if (!previous) console.log(JSON.stringify({ scope: 'share', event: 'peer-joined', peer: peerId }));
     people.set(peerId, { peerId, displayName: name, seenAt: now });
     for (const share of shares.values()) {
       if (share.ownerPeerId === peerId && share.held && !share.revoked) share.lastSeen = now;
@@ -64,8 +65,10 @@ export function createShareHub(maxFileBytes: number) {
   function online(now = Date.now()): Person[] {
     const list: Person[] = [];
     for (const [id, person] of people) {
-      if (now - person.seenAt > ONLINE_MS) people.delete(id);
-      else list.push(person);
+      if (now - person.seenAt > ONLINE_MS) {
+        people.delete(id);
+        console.log(JSON.stringify({ scope: 'share', event: 'peer-left', peer: id }));
+      } else list.push(person);
     }
     return list;
   }
@@ -158,18 +161,24 @@ export function createShareHub(maxFileBytes: number) {
     };
   }
 
-  function beginFile(shareId: string, fileId: string, requesterPeerId: string, now = Date.now()) {
+  function accessFile(shareId: string, fileId: string, requesterPeerId: string, now = Date.now()) {
     const share = allowedShare(shareId, requesterPeerId, now);
     if ('error' in share) return share;
     const file = share.files.find((item) => item.id === fileId);
     if (!file) return { error: 'missing' as const };
-    if (activeCount() >= MAX_JOBS) return { error: 'busy' as const };
-    const job = makeJob('file', share, requesterPeerId, [file], now);
-    jobs.set(job.id, job);
-    return { job, file };
+    return { share, file };
   }
 
-  function beginZip(shareId: string, dirInput: unknown, fileIds: unknown, requesterPeerId: string, now = Date.now()) {
+  function beginFile(shareId: string, fileId: string, requesterPeerId: string, now = Date.now()): { job: Job; file: PreparedFile } | { error: string } {
+    const looked = accessFile(shareId, fileId, requesterPeerId, now);
+    if ('error' in looked) return { error: looked.error ?? 'missing' };
+    if (activeCount() >= MAX_JOBS) return { error: 'busy' };
+    const job = makeJob('file', looked.share, requesterPeerId, [looked.file], now);
+    jobs.set(job.id, job);
+    return { job, file: looked.file };
+  }
+
+  function accessZip(shareId: string, dirInput: unknown, fileIds: unknown, requesterPeerId: string, now = Date.now()) {
     const share = allowedShare(shareId, requesterPeerId, now);
     if ('error' in share) return share;
     let selected = share.files;
@@ -182,10 +191,16 @@ export function createShareHub(maxFileBytes: number) {
       selected = filesUnder(share.files, dir ?? '');
     }
     if (selected.length === 0) return { error: 'missing' as const };
-    if (activeCount() >= MAX_JOBS) return { error: 'busy' as const };
-    const job = makeJob('zip', share, requesterPeerId, selected, now);
+    return { share, files: selected };
+  }
+
+  function beginZip(shareId: string, dirInput: unknown, fileIds: unknown, requesterPeerId: string, now = Date.now()): { job: Job; files: PreparedFile[] } | { error: string } {
+    const looked = accessZip(shareId, dirInput, fileIds, requesterPeerId, now);
+    if ('error' in looked) return { error: looked.error ?? 'missing' };
+    if (activeCount() >= MAX_JOBS) return { error: 'busy' };
+    const job = makeJob('zip', looked.share, requesterPeerId, looked.files, now);
     jobs.set(job.id, job);
-    return { job, files: selected };
+    return { job, files: looked.files };
   }
 
   function outbox(ownerPeerId: string, now = Date.now()) {
@@ -243,6 +258,14 @@ export function createShareHub(maxFileBytes: number) {
   function cancelDownload(jobId: string): void {
     const job = jobs.get(jobId);
     if (job) cancelJob(job, 'The download was cancelled.');
+  }
+
+  function abortJob(jobId: string, ownerPeerId: string): boolean {
+    const job = jobs.get(jobId);
+    if (!job || job.ownerPeerId !== ownerPeerId) return false;
+    console.log(JSON.stringify({ scope: 'share', event: 'transfer-abort', transfer: job.id, share: job.shareId }));
+    cancelJob(job, 'The sender does not still have this file.');
+    return true;
   }
 
   function finish(jobId: string): void {
@@ -393,12 +416,15 @@ export function createShareHub(maxFileBytes: number) {
     revoke,
     list,
     browse,
+    accessFile,
+    accessZip,
     beginFile,
     beginZip,
     outbox,
     takeBytes,
     waitForFile,
     cancelDownload,
+    abortJob,
     finish,
     postSignal,
     takeSignals,

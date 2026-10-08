@@ -35,6 +35,7 @@ html[data-theme="dark"] {
 * { box-sizing: border-box; }
 
 body {
+  overflow-x: clip;
   margin: 0;
   background:
     radial-gradient(circle at top left, rgba(15, 110, 107, 0.08), transparent 28rem),
@@ -197,7 +198,7 @@ dialog.preview pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; ma
 .queue h3 { margin: 0; font-size: 0.95rem; }
 .queue ul { list-style: none; padding: 0; margin: 0.6rem 0 0; display: grid; gap: 0.7rem; }
 .queue-row { justify-content: space-between; }
-.filename { overflow-wrap: anywhere; }
+.filename { overflow-wrap: anywhere; min-width: 0; }
 .meta, .pill { color: var(--muted); font-size: 0.92rem; }
 .pill.done { color: var(--ok); }
 .pill.error, .fail { color: var(--danger); }
@@ -222,6 +223,10 @@ dialog.preview pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; ma
 .section-toggle { margin-bottom: 0.8rem; }
 .section-toggle button { min-height: 2.75rem; background: transparent; color: var(--ink); border: 1px solid var(--line); }
 .share-desk { display: grid; gap: 0.85rem; }
+.connection-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.5rem; margin: 0; }
+.connection-status div { min-height: 2.75rem; }
+.connection-status dt { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.connection-status dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
 .share-desk[hidden] { display: none; }
 .share-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .share-actions > .button,
@@ -240,7 +245,8 @@ dialog.preview pre { max-height: 60vh; overflow: auto; white-space: pre-wrap; ma
 }
 .share-preview fieldset { border: 1px solid var(--line); border-radius: 12px; display: grid; gap: 0.35rem; }
 .share-tree { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.45rem; }
-.share-tree li { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.share-tree li { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; overflow-wrap: anywhere; }
+.share-tree a, .share-tree button { overflow-wrap: anywhere; }
 .share-tree a { color: var(--accent-dark); font-weight: 700; min-height: 2.75rem; display: inline-flex; align-items: center; }
 .check { display: flex; flex-direction: row; align-items: center; gap: 0.45rem; min-height: 2.75rem; }
 .unavailable { color: #8a3b12; font-weight: 700; }
@@ -264,11 +270,49 @@ th { font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; colo
 .actions a { color: var(--accent-dark); font-weight: 700; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 
-@media (max-width: 720px) {
+@media (max-width: 767px) {
+  .shell { width: min(1100px, calc(100% - 1rem)); }
   .drop, .top { flex-direction: column; align-items: stretch; }
-  .who { justify-content: space-between; }
+  .who { justify-content: space-between; flex-wrap: wrap; }
+  .toolbar label, .inline-rename input, .folder-create { min-width: 0; width: 100%; }
+  .folder-create { flex-direction: column; align-items: stretch; }
   .share-actions > .button,
   .share-actions > button,
   .share-actions > a.button,
   .section-toggle button { flex: 1 1 100%; }
+  .grid { grid-template-columns: 1fr; }
+  .table-wrap { overflow: visible; }
+  table.files thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+  table.files, table.files tbody, table.files tr, table.files td { display: block; width: auto; }
+  table.files tr {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  table.files td { border: 0; padding: 0.25rem 0; }
+  table.files td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  table.files .filename { display: block; }
+  table.files .actions { justify-content: flex-start; }
+  table.files .actions a,
+  table.files .actions button {
+    min-height: 2.75rem;
+    display: inline-flex;
+    align-items: center;
+  }
+  .connection-status { grid-template-columns: 1fr 1fr; }
 }

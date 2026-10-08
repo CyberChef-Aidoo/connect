@@ -1355,6 +1355,80 @@ describe('portal', () => {
     });
   });
 
+  it('lets two browsers of one account see each other without sharing a signal inbox', async () => {
+    await withPortal({}, async (handle) => {
+      const first = await account(handle, 'ada');
+      const second = request.agent(handle.app);
+      const login = await second.post('/api/auth/login').send({ username: 'ada', password: PASSWORD });
+      assert.equal(login.status, 200);
+      const csrf = login.body.csrfToken as string;
+      assert.equal(login.body.user.id, first.userId);
+      await first.agent.post('/api/peers/heartbeat').set('X-CSRF-Token', first.csrf);
+      await second.post('/api/peers/heartbeat').set('X-CSRF-Token', csrf);
+      const people = await second.get('/api/peers');
+      assert.equal(people.body.browsers.length, 1);
+      assert.equal(people.body.browsers[0].userId, first.userId);
+      const uploaded = await uploadNamed(first.agent, first.csrf, 'notes.txt', 'same-account');
+      const ask = await second.post('/api/signals').set('X-CSRF-Token', csrf).send({
+        fileId: uploaded.body.file.id,
+        toUserId: first.userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(ask.status, 200);
+      assert.equal((await second.get('/api/signals')).body.signals.length, 0);
+      const owner = await first.agent.get('/api/signals');
+      assert.equal(owner.body.signals.length, 1);
+      assert.equal(owner.body.signals[0].kind, 'request');
+    });
+  });
+
+  it('keeps open-access browsers separate and still downloads a library file over a LAN host', async () => {
+    await withPortal({ openAccess: true }, async (handle) => {
+      const first = request.agent(handle.app);
+      const me = await first.get('/api/auth/me');
+      assert.equal(me.status, 200);
+      const csrf = me.body.csrfToken as string;
+      const userId = me.body.user.id as string;
+      await first.post('/api/peers/heartbeat').set('X-CSRF-Token', csrf).send({ displayName: 'One' });
+
+      const second = request.agent(handle.app);
+      const other = await second.get('/api/auth/me');
+      const otherCsrf = other.body.csrfToken as string;
+      assert.equal(other.body.user.id, userId);
+      await second.post('/api/peers/heartbeat').set('X-CSRF-Token', otherCsrf).send({ displayName: 'Two' });
+
+      const people = await second.get('/api/peers');
+      assert.equal(people.body.browsers.length, 1);
+      assert.equal(people.body.browsers[0].userId, userId);
+      const sharePeople = await second.get('/api/share-peers');
+      assert.equal(sharePeople.body.people.length, 1);
+      assert.equal(sharePeople.body.people[0].displayName, 'One');
+
+      const uploaded = await uploadNamed(first, otherCsrf, 'notes.txt', 'open-access');
+      assert.equal(uploaded.status, 403);
+      const stored = await uploadNamed(first, csrf, 'notes.txt', 'open-access');
+      assert.equal(stored.status, 201);
+      const fileId = stored.body.file.id as string;
+      const ask = await second.post('/api/signals').set('X-CSRF-Token', otherCsrf).send({
+        fileId,
+        toUserId: userId,
+        kind: 'request',
+        payload: '',
+      });
+      assert.equal(ask.status, 200);
+      assert.equal((await second.get('/api/signals')).body.signals.length, 0);
+      assert.equal((await first.get('/api/signals')).body.signals.length, 1);
+
+      const downloaded = await second
+        .get(`/api/files/${fileId}/download`)
+        .set('Host', '172.20.10.13:8443');
+      assert.equal(downloaded.status, 200);
+      assert.equal(responseText(downloaded), 'open-access');
+      assert.equal((await request(handle.app).get(`/api/files/${fileId}/download`)).status, 401);
+    });
+  });
+
   it('opens the file list without a password when open access is on', async () => {
     await withPortal({ openAccess: true }, async (handle) => {
       const locked = await request(handle.app).get('/api/files');

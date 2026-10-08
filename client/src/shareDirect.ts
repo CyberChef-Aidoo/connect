@@ -11,7 +11,8 @@ type Link = {
 };
 
 export function directShareAvailable(size: number): boolean {
-  return typeof RTCPeerConnection !== 'undefined' && size > 0 && size <= DIRECT_MAX_BYTES;
+  const secure = typeof window === 'undefined' ? false : window.isSecureContext;
+  return secure && typeof RTCPeerConnection !== 'undefined' && size > 0 && size <= DIRECT_MAX_BYTES;
 }
 
 export function createShareDirect(lookup: (fileId: string) => File | undefined) {

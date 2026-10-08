@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { ApiError } from './api';
+import { randomId } from './randomId';
 import { formatBytes } from './format';
 import { createShareDirect, directShareAvailable } from './shareDirect';
 import {
+  abortOutbox,
   browseShare,
+  confirmRelay,
   folderSelectionAvailable,
   listSharePeers,
   listShares,
@@ -49,11 +52,21 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+  const [selfId, setSelfId] = useState('');
+  const [apiState, setApiState] = useState('Checking…');
+  const [signalState, setSignalState] = useState('Connecting…');
+  const [transferMode, setTransferMode] = useState('Idle');
+  const [polledAt, setPolledAt] = useState<number | null>(null);
+  const reported = useRef('');
+  const missingJobs = useRef(new Set<string>());
 
   useEffect(() => {
     let stop = false;
+    let polling = false;
     void releaseShares(csrf).catch(() => undefined);
-    const timer = window.setInterval(() => {
+    const tick = () => {
+      if (polling || stop) return;
+      polling = true;
       void (async () => {
         try {
           const [peerList, shareList, jobs, signals] = await Promise.all([
@@ -63,16 +76,41 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
             takeShareSignals(),
           ]);
           if (stop) return;
+          setApiState('Reachable');
+          setSignalState('HTTP connected');
+          setPolledAt(Date.now());
+          setSelfId(peerList.self);
           setPeople(peerList.people);
           setShares(shareList);
-          for (const signal of signals) await direct.current.handle(signal, csrf);
+          const summary = `${peerList.self}:${peerList.people.length}`;
+          if (reported.current !== summary) {
+            reported.current = summary;
+            console.info('portal connection', {
+              api: 'reachable',
+              signaling: 'http',
+              session: peerList.self,
+              peers: peerList.people.length,
+            });
+          }
+          for (const signal of signals) {
+            console.info('portal signal', { transfer: signal.transferId, kind: signal.kind });
+            await direct.current.handle(signal, csrf);
+          }
           for (const job of jobs) {
             if (!job.ready || !job.nextFileId) continue;
             const key = `${job.id}:${job.nextFileId}`;
             if (sending.current.has(key)) continue;
             const file = filesRef.current.get(job.nextFileId);
-            if (!file) continue;
+            if (!file) {
+              if (!missingJobs.current.has(job.id)) {
+                missingJobs.current.add(job.id);
+                console.info('portal transfer', { transfer: job.id, mode: 'relay', result: 'source-missing' });
+                void abortOutbox(job.id, csrf).catch(() => undefined);
+              }
+              continue;
+            }
             sending.current.add(key);
+            console.info('portal transfer', { transfer: job.id, file: job.nextFileId, mode: 'relay', bytes: file.size });
             try {
               await sendSharedBytes(job.id, job.nextFileId, file, csrf);
             } catch {
@@ -82,10 +120,24 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
             }
           }
         } catch (caught) {
-          if (!stop && caught instanceof ApiError && caught.status !== 401) setError(caught.message);
+          if (stop) return;
+          const reason = caught instanceof Error ? caught.message : 'The portal could not be reached.';
+          if (caught instanceof TypeError) {
+            setApiState('Unreachable');
+            setSignalState('Not connected');
+          } else {
+            setApiState('Reachable');
+            setSignalState(caught instanceof ApiError && caught.status === 401 ? 'Session was not sent' : 'Not connected');
+          }
+          setError(reason);
+          console.info('portal connection', { api: caught instanceof TypeError ? 'unreachable' : 'error', detail: reason });
+        } finally {
+          polling = false;
         }
       })();
-    }, 1500);
+    };
+    tick();
+    const timer = window.setInterval(tick, 1500);
     return () => {
       stop = true;
       window.clearInterval(timer);
@@ -121,7 +173,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     if (incoming.length === 0) return;
     setError('');
     const rows: Draft[] = incoming.map((file) => ({
-      clientToken: crypto.randomUUID(),
+      clientToken: randomId(),
       relativePath: chosenPath(file),
       size: file.size,
       modifiedAt: file.lastModified,
@@ -186,7 +238,9 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     directAbort.current = controller;
     const label = file.relativePath.split('/').pop() ?? 'download';
     setBusy(`Receiving ${label}…`);
+    setTransferMode('Direct');
     setError('');
+    console.info('portal transfer', { share: share.id, file: file.id, mode: 'direct' });
     try {
       const blob = await direct.current.receive(share.id, file.id, share.ownerPeerId, csrf, {
         signal: controller.signal,
@@ -199,17 +253,57 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setMessage(`Received ${link.download} directly from their browser.`);
+      setTransferMode('Idle');
     } catch (caught) {
+      setTransferMode('Relay');
       setError(caught instanceof Error ? caught.message : 'Direct download is not available. Use Download through this computer.');
+      console.info('portal transfer', { share: share.id, file: file.id, mode: 'direct', result: 'failed' });
     } finally {
       setBusy('');
+    }
+  }
+
+  async function startRelay(event: { preventDefault: () => void; currentTarget: HTMLAnchorElement }) {
+    event.preventDefault();
+    const href = event.currentTarget.href;
+    setTransferMode('Relay');
+    setError('');
+    try {
+      await confirmRelay(href);
+      console.info('portal transfer', { mode: 'relay', url: new URL(href).pathname });
+      const link = document.createElement('a');
+      link.href = href;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setMessage('Downloading through this computer. Progress is in the browser’s download list. Cancel it there to stop the transfer.');
+    } catch (caught) {
+      setTransferMode('Idle');
+      setError(caught instanceof Error ? caught.message : 'That download is not available.');
     }
   }
 
   const mine = shares.filter((share) => share.mine && !share.revoked);
   const others = shares.filter((share) => !share.mine && !share.revoked);
 
+  const sources = shares.filter((share) => share.available && !share.revoked).length;
+  const status = (
+    <dl className="connection-status">
+      <div><dt>Build</dt><dd>{__PORTAL_BUILD__}</dd></div>
+      <div><dt>API</dt><dd>{apiState}</dd></div>
+      <div><dt>Signaling</dt><dd>{signalState}</dd></div>
+      <div><dt>Session</dt><dd>{selfId ? 'Registered' : 'Not registered'}</dd></div>
+      <div><dt>Last poll</dt><dd>{polledAt ? new Date(polledAt).toLocaleTimeString() : 'None'}</dd></div>
+      <div><dt>Peers</dt><dd>{people.length}{people.length > 0 ? `: ${people.map((person) => person.displayName).join(', ')}` : ''}</dd></div>
+      <div><dt>Sources</dt><dd>{sources} available</dd></div>
+      <div><dt>Transfer</dt><dd>{transferMode}{typeof window !== 'undefined' && window.isSecureContext ? '' : ' · direct needs HTTPS'}</dd></div>
+    </dl>
+  );
+
   return (
+    <>
+    {hidden ? <section className="panel" aria-label="Connection">{status}</section> : null}
     <section className="panel share-desk" hidden={hidden}>
       <h2>Read-only shares</h2>
       <p>
@@ -218,6 +312,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
         Switching to Library does not stop a share. Reloading or closing the tab does, until you select the files again.
         Nothing here can be edited or deleted on the other computer. A copy someone already received cannot be recalled.
       </p>
+      {hidden ? null : status}
       <label className="share-name">
         Your name on this network
         <input value={nameOnNetwork} onChange={(event) => rememberName(event.target.value)} />
@@ -316,6 +411,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       )}
 
       <h3>People here</h3>
+      <p className="meta">{people.length === 0 ? 'No other browser is connected yet.' : `Connected: ${people.map((person) => person.displayName).join(', ')}.`}</p>
       {others.length === 0 ? <p className="meta">No one else is publishing a share you can open.</p> : (
         <ul className="share-tree">
           {others.map((share) => (
@@ -344,9 +440,9 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
           {listing.share.available ? (
             <div className="share-actions">
               {listing.search ? null : (
-                <a className="button" href={relayZipUrl(listing.share.id, dir)}>Download this folder through this computer</a>
+                <a className="button" href={relayZipUrl(listing.share.id, dir)} onClick={(event) => void startRelay(event)}>Download this folder through this computer</a>
               )}
-              {picked.length > 0 ? <a className="button" href={relayZipUrl(listing.share.id, '', picked)}>Download selected through this computer</a> : null}
+              {picked.length > 0 ? <a className="button" href={relayZipUrl(listing.share.id, '', picked)} onClick={(event) => void startRelay(event)}>Download selected through this computer</a> : null}
               <p className="meta">Download through this computer uses the browser’s download list. That list shows progress, and canceling it stops the transfer. A folder is packed as a zip as it is sent. The portal does not keep the zip.</p>
             </div>
           ) : null}
@@ -372,7 +468,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
                   <button type="button" onClick={() => void takeDirect(listing.share, file)}>Direct download</button>
                 ) : null}
                 {listing.share.available ? (
-                  <a href={relayFileUrl(listing.share.id, file.id)}>Download through this computer</a>
+                  <a href={relayFileUrl(listing.share.id, file.id)} onClick={(event) => void startRelay(event)}>Download through this computer</a>
                 ) : null}
               </li>
             ))}
@@ -380,6 +476,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
         </div>
       ) : null}
     </section>
+    </>
   );
 }
 

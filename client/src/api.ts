@@ -125,24 +125,33 @@ export async function login(username: string, password: string): Promise<Session
   return normalizeSession(await readJson<Session>(response));
 }
 
-export async function heartbeat(csrfToken: string): Promise<void> {
+export function pageUrl(path: string): string {
+  if (typeof window === 'undefined') return path;
+  return new URL(path, window.location.origin).href;
+}
+
+export type BrowserPeer = { userId: string; peerId: string };
+
+export async function heartbeat(csrfToken: string): Promise<string> {
   const displayName = typeof localStorage === 'undefined' ? 'This browser' : (localStorage.getItem('portal-share-name') || 'This browser');
-  const response = await fetch('/api/peers/heartbeat', {
+  const response = await fetch(pageUrl('/api/peers/heartbeat'), {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
     body: JSON.stringify({ displayName }),
   });
-  await readJson(response);
+  const body = await readJson<{ peerId?: string }>(response);
+  return body.peerId ?? '';
 }
 
-export async function listPeers(): Promise<{ online: string[] }> {
-  const response = await fetch('/api/peers', { credentials: 'same-origin' });
-  return readJson(response);
+export async function listPeers(): Promise<{ online: string[]; browsers: BrowserPeer[] }> {
+  const response = await fetch(pageUrl('/api/peers'), { credentials: 'same-origin' });
+  const body = await readJson<{ online?: string[]; browsers?: BrowserPeer[] }>(response);
+  return { online: body.online ?? [], browsers: body.browsers ?? [] };
 }
 
 export async function takeSignals(): Promise<{ signals: DirectSignal[] }> {
-  const response = await fetch('/api/signals', { credentials: 'same-origin' });
+  const response = await fetch(pageUrl('/api/signals'), { credentials: 'same-origin' });
   return readJson(response);
 }
 
@@ -153,7 +162,7 @@ export async function postSignal(body: {
   transferId?: string;
   payload: string;
 }, csrfToken: string): Promise<{ transferId: string }> {
-  const response = await fetch('/api/signals', {
+  const response = await fetch(pageUrl('/api/signals'), {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
@@ -557,6 +566,10 @@ async function postJson<T>(url: string, body: unknown, csrfToken: string, signal
 
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
+  const type = response.headers.get('content-type') ?? '';
+  if (type.includes('text/html') || text.trimStart().startsWith('<!')) {
+    throw new ApiError(response.status || 502, 'The server returned the website instead of an API response.');
+  }
   if (!response.ok) {
     throw new ApiError(response.status, messageFrom(response.status, text));
   }

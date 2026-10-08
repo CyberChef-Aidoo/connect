@@ -47,6 +47,7 @@ import {
   type UploadSession,
 } from './api';
 import { createDirectHub } from './directSend';
+import { randomId } from './randomId';
 import { ShareDesk } from './ShareDesk';
 import { folderPlacement, readDataTransfer, type PlannedUpload } from './folderUpload';
 import { rememberLocalFile } from './localFiles';
@@ -169,6 +170,7 @@ function Login({ onSuccess, theme }: { onSuccess: (session: Session) => void; th
       <ThemeButton theme={theme} floating />
       <form className="card login" onSubmit={submit}>
         <p className="eyebrow">Local file portal</p>
+        <p className="meta">Build {__PORTAL_BUILD__}</p>
         <h1>Sign in</h1>
         <p className="lede">Files stay on this computer. Use the account created for you on the server.</p>
         {error ? <p className="banner error" role="alert">{error}</p> : null}
@@ -237,7 +239,8 @@ function Dashboard({
   const [binOpen, setBinOpen] = useState(false);
   const [binFiles, setBinFiles] = useState<BinFile[]>([]);
   const [binDays, setBinDays] = useState(30);
-  const [online, setOnline] = useState<string[]>([]);
+  const [browsers, setBrowsers] = useState<Array<{ userId: string; peerId: string }>>([]);
+  const [selfPeerId, setSelfPeerId] = useState('');
   const [takingId, setTakingId] = useState<string | null>(null);
   const [desk, setDesk] = useState<'share' | 'library'>('share');
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
@@ -252,15 +255,16 @@ function Dashboard({
     const hub = direct.current;
     let stop = false;
     let polling = false;
-    const timer = window.setInterval(() => {
+    const tick = () => {
       if (polling || stop) return;
       polling = true;
       void (async () => {
         try {
-          await heartbeat(csrf);
+          const peerId = await heartbeat(csrf);
           const [people, inbox] = await Promise.all([listPeers(), takeSignals()]);
           if (stop) return;
-          setOnline(people.online);
+          setBrowsers(people.browsers);
+          if (peerId) setSelfPeerId(peerId);
           for (const signal of inbox.signals) {
             await hub.handle(signal, csrf);
           }
@@ -270,10 +274,17 @@ function Dashboard({
           polling = false;
         }
       })();
-    }, 2000);
+    };
+    tick();
+    const timer = window.setInterval(tick, 2000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       stop = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
       hub.close();
     };
   }, [csrf, onSession]);
@@ -554,7 +565,7 @@ function Dashboard({
     const next: UploadItem[] = incoming.map(({ file, folderId: target }) => {
       const tooBig = file.size > session.limits.maxFileBytes;
       return {
-        id: crypto.randomUUID(),
+        id: randomId(),
         attempt: 1,
         file,
         sessionId: null,
@@ -583,7 +594,7 @@ function Dashboard({
     setResumeError('');
     const progress = file.size > 0 ? Math.min(100, Math.round((upload.receivedBytes / file.size) * 100)) : 0;
     setUploads((current) => [{
-      id: crypto.randomUUID(),
+      id: randomId(),
       attempt: 1,
       file,
       sessionId: upload.id,
@@ -843,7 +854,7 @@ function Dashboard({
   }
 
   function canDirect(file: PortalFile): boolean {
-    return file.ownerId !== session.user.id && online.includes(file.ownerId);
+    return browsers.some((browser) => browser.userId === file.ownerId && browser.peerId !== selfPeerId);
   }
 
   async function takeDirect(file: PortalFile) {
@@ -881,6 +892,7 @@ function Dashboard({
       <header className="top">
         <div>
           <p className="eyebrow">Local file portal</p>
+          <p className="meta">Build {__PORTAL_BUILD__}</p>
           <h1>Shared files</h1>
         </div>
         <div className="who">
@@ -1516,7 +1528,7 @@ function FileTable({
 
   return (
     <div className="table-wrap">
-      <table>
+      <table className="files">
         <caption>You can delete files you uploaded. Anyone signed in can download. Direct sends from the uploader’s open browser when they are here.</caption>
         <thead>
           <tr>
@@ -1563,10 +1575,10 @@ function FileTable({
                 {file.originalName}
                 {searching && file.folderName ? <span className="meta"> In {file.folderName}</span> : null}
               </td>
-              <td>{formatBytes(file.sizeBytes)}</td>
-              <td>{formatWhen(file.createdAt)}</td>
-              <td>{file.ownerUsername}</td>
-              <td className="actions">
+              <td data-label="Size">{formatBytes(file.sizeBytes)}</td>
+              <td data-label="Uploaded">{formatWhen(file.createdAt)}</td>
+              <td data-label="By">{file.ownerUsername}</td>
+              <td className="actions" data-label="Actions">
                 {file.preview === 'image' || file.preview === 'text' ? (
                   <button type="button" className="ghost" onClick={() => onPreview(file)}>Preview</button>
                 ) : null}

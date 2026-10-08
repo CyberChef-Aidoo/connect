@@ -149,6 +149,28 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   });
   app.use('/api/shares', express.json({ limit: '512kb' }));
   app.use(express.json({ limit: '20kb' }));
+  app.use('/api', (req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+      next();
+      return;
+    }
+    const origin = req.get('origin');
+    if (!origin) {
+      next();
+      return;
+    }
+    try {
+      const url = new URL(origin);
+      if (url.host !== req.get('host')) {
+        res.status(403).json({ error: 'This action must come from this portal.' });
+        return;
+      }
+    } catch {
+      res.status(403).json({ error: 'This action must come from this portal.' });
+      return;
+    }
+    next();
+  });
   app.use(session({
     name: 'portal.sid',
     secret: config.sessionSecret,
@@ -214,8 +236,8 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
 
   app.post('/api/peers/heartbeat', requireAuth, requireCsrf, async (req, res, next) => {
     try {
-      peers.beat(req.session.userId!);
       const peerId = await ensurePeerId(req);
+      peers.beat(req.session.userId!, peerId);
       shareHub.beat(peerId, req.body?.displayName);
       res.json({ ok: true, peerId });
     } catch (error) {
@@ -225,15 +247,31 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
 
   registerShareRoutes(app, shareHub, requireAuth, requireCsrf, ensurePeerId);
 
-  app.get('/api/peers', requireAuth, (req, res) => {
-    res.json({ online: peers.onlineIds() });
+  app.get('/api/peers', requireAuth, async (req, res, next) => {
+    try {
+      const self = await ensurePeerId(req);
+      const browsers = peers.onlineBrowsers()
+        .filter((browser) => browser.peerId !== self)
+        .map((browser) => ({ userId: browser.userId, peerId: browser.peerId }));
+      res.json({
+        online: [...new Set(browsers.map((browser) => browser.userId))],
+        browsers,
+      });
+    } catch (error) {
+      next(error);
+    }
   });
 
-  app.get('/api/signals', requireAuth, (req, res) => {
-    res.json({ signals: peers.take(req.session.userId!) });
+  app.get('/api/signals', requireAuth, async (req, res, next) => {
+    try {
+      res.json({ signals: peers.take(await ensurePeerId(req)) });
+    } catch (error) {
+      next(error);
+    }
   });
 
-  app.post('/api/signals', requireAuth, requireCsrf, (req, res) => {
+  app.post('/api/signals', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
     const body = req.body ?? {};
     const fileId = typeof body.fileId === 'string' ? body.fileId : '';
     const record = getReadyFile(db, fileId, req.session.userId!);
@@ -243,6 +281,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     }
     const result = peers.post({
       fromUserId: req.session.userId!,
+      fromPeerId: await ensurePeerId(req),
       fileOwnerId: record.ownerId,
       fileId: record.id,
       toUserId: typeof body.toUserId === 'string' ? body.toUserId : '',
@@ -255,6 +294,9 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
       return;
     }
     res.json({ transferId: result.transferId });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.post('/api/auth/logout', requireAuth, requireCsrf, (req, res, next) => {

@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import { createApp } from '../src/app.js';
 import type { AppConfig } from '../src/config.js';
 import { prepareShareFiles, sanitizeSharePath } from '../src/sharePaths.js';
+import { createShareHub } from '../src/shares.js';
 
 function testConfig(dir: string): AppConfig {
   return {
@@ -41,6 +42,18 @@ describe('share paths', () => {
     ], 10, 100);
     assert.equal(prepared.rejected.length, 0);
     assert.deepEqual(prepared.files.map((file) => file.relativePath), ['Folder/Notes.txt', 'folder/notes (2).txt']);
+  });
+});
+
+describe('share presence', () => {
+  it('forgets a browser that stops checking in, and shows it again when it returns', () => {
+    const hub = createShareHub(1000);
+    hub.beat('ada', 'Ada', 0);
+    hub.beat('blake', 'Blake', 0);
+    assert.equal(hub.online(0).length, 2);
+    assert.equal(hub.online(21_000).length, 0);
+    hub.beat('blake', 'Blake', 22_000);
+    assert.deepEqual(hub.online(22_000).map((person) => person.peerId), ['blake']);
   });
 });
 
@@ -175,6 +188,102 @@ describe('read-only shares', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('lists the other browser, refuses another site, and does not replace API errors with the website', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'portal-share-peers-'));
+    const handle = await createApp(testConfig(dir), { passwordCost: 4 });
+    const server = http.createServer(handle.app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const address = server.address();
+    const listenPort = typeof address === 'object' && address ? address.port : 0;
+    const base = `http://127.0.0.1:${listenPort}`;
+    try {
+      const ada = await signIn(base, 'Ada');
+      const blake = await signIn(base, 'Blake');
+      const peers = await get(base, ada, '/api/share-peers');
+      assert.equal(peers.status, 200);
+      const peerBody = await peers.json() as { self: string; people: Array<{ peerId: string; displayName: string }> };
+      assert.equal(peerBody.self, ada.peerId);
+      assert.deepEqual(peerBody.people.map((person) => person.displayName), ['Blake']);
+      const library = await get(base, ada, '/api/peers');
+      const libraryBody = await library.json() as { browsers: Array<{ userId: string; peerId: string }> };
+      assert.equal(library.status, 200);
+      assert.equal(libraryBody.browsers.length, 1);
+      assert.equal(libraryBody.browsers[0].peerId, blake.peerId);
+      assert.notEqual(libraryBody.browsers[0].peerId, ada.peerId);
+
+      const foreign = await fetch(`${base}/api/peers/heartbeat`, {
+        method: 'POST',
+        headers: {
+          Cookie: ada.cookie,
+          'X-CSRF-Token': ada.csrf,
+          'Content-Type': 'application/json',
+          Origin: 'http://evil.example',
+        },
+        body: '{}',
+      });
+      assert.equal(foreign.status, 403);
+      assert.match(foreign.headers.get('content-type') ?? '', /json/);
+
+      const missing = await get(base, ada, '/api/not-a-route');
+      const missingText = await missing.text();
+      assert.equal(missing.status, 404);
+      assert.match(missing.headers.get('content-type') ?? '', /json/);
+      assert.equal(missingText.trimStart().startsWith('<'), false);
+
+      const shared = await send(base, ada, '/api/shares', {
+        name: 'Note',
+        peerIds: [blake.peerId],
+        files: [{ clientToken: 'c', relativePath: 'note.txt', size: 5, modifiedAt: 1 }],
+      });
+      const shareId = shared.body.share.id as string;
+      const fileId = shared.body.files[0].id as string;
+      const outsider = await signIn(base, 'Cara');
+      const refused = await get(base, outsider, `/api/shares/${shareId}/files/${fileId}?check=1`);
+      assert.equal(refused.status, 403);
+      assert.match(refused.headers.get('content-type') ?? '', /json/);
+
+      const checked = await get(base, blake, `/api/shares/${shareId}/files/${fileId}?check=1`);
+      assert.equal(checked.status, 200);
+      const checkedBody = await checked.json() as { mode: string };
+      assert.equal(checkedBody.mode, 'relay');
+      const idle = await fetch(`${base}/api/shares/outbox`, { headers: { Cookie: ada.cookie } });
+      const idleBody = await idle.json() as { jobs: unknown[] };
+      assert.equal(idleBody.jobs.length, 0);
+
+      const hanging = get(base, blake, `/api/shares/${shareId}/files/${fileId}`);
+      const job = await waitForReady(base, ada, fileId);
+      const aborted = await fetch(`${base}/api/shares/outbox/${job.id}/abort`, {
+        method: 'POST',
+        headers: { Cookie: ada.cookie, 'X-CSRF-Token': ada.csrf },
+      });
+      assert.equal(aborted.status, 200);
+      const stopped = await hanging;
+      assert.equal(stopped.status, 502);
+      const stoppedBody = await stopped.json() as { error: string };
+      assert.match(stoppedBody.error, /does not still have this file/);
+
+      const again = await send(base, ada, '/api/shares', {
+        name: 'Chunk',
+        peerIds: [blake.peerId],
+        files: [{ clientToken: 'd', relativePath: 'chunk.txt', size: 5, modifiedAt: 1 }],
+      });
+      const chunkShare = again.body.share.id as string;
+      const chunkFile = again.body.files[0].id as string;
+      const download = get(base, blake, `/api/shares/${chunkShare}/files/${chunkFile}`);
+      const ready = await waitForReady(base, ada, chunkFile);
+      const posted = await postChunked(listenPort, `/api/shares/outbox/${ready.id}/files/${chunkFile}`, ada, Buffer.from('hello'));
+      assert.equal(posted.status, 200);
+      const received = await download;
+      assert.equal(received.status, 200);
+      assert.equal(received.headers.get('x-transfer-mode'), 'relay');
+      assert.equal(await received.text(), 'hello');
+    } finally {
+      server.close();
+      handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 async function signIn(base: string, displayName: string) {
@@ -217,6 +326,33 @@ async function waitForReady(base: string, who: { cookie: string }, fileId?: stri
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error('The sender never saw the download.');
+}
+
+function postChunked(
+  port: number,
+  pathName: string,
+  who: { cookie: string; csrf: string },
+  body: Buffer,
+): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: pathName,
+      method: 'POST',
+      headers: {
+        Cookie: who.cookie,
+        'X-CSRF-Token': who.csrf,
+        'Content-Type': 'application/octet-stream',
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
 async function postReadyFile(base: string, who: { cookie: string; csrf: string }, fileId: string, text: string) {

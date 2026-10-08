@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import type { Express } from 'express';
 import { once } from 'node:events';
@@ -73,6 +74,19 @@ export function registerShareRoutes(
     }
   });
 
+  app.post('/api/shares/outbox/:jobId/abort', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
+      const jobId = routeParam(req, 'jobId');
+      if (!hub.abortJob(jobId, await peerIdFor(req))) {
+        res.status(404).json({ error: 'That download is no longer waiting.' });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post('/api/shares/outbox/:jobId/files/:fileId', requireAuth, requireCsrf, async (req, res, next) => {
     try {
       const taken = hub.takeBytes(routeParam(req, 'jobId'), routeParam(req, 'fileId'), await peerIdFor(req));
@@ -80,8 +94,8 @@ export function registerShareRoutes(
         res.status(409).json({ error: taken.error });
         return;
       }
-      const length = Number(req.get('content-length'));
-      if (!Number.isSafeInteger(length) || length !== taken.size) {
+      const declared = req.get('content-length');
+      if (declared !== undefined && Number(declared) !== taken.size) {
         taken.stream.destroy();
         res.status(400).json({ error: 'The file size does not match the share.' });
         return;
@@ -99,6 +113,7 @@ export function registerShareRoutes(
         return;
       }
       taken.stream.end();
+      shareLog('bytes accepted', { file: routeParam(req, 'fileId'), bytes: seen });
       res.json({ ok: true });
     } catch (error) {
       next(error);
@@ -159,11 +174,26 @@ export function registerShareRoutes(
 
   app.get('/api/shares/:id/files/:fileId', requireAuth, async (req, res, next) => {
     try {
-      const started = hub.beginFile(routeParam(req, 'id'), routeParam(req, 'fileId'), await peerIdFor(req));
-      if ('error' in started) {
+      const requestId = randomUUID();
+      res.setHeader('X-Request-Id', requestId);
+      const peerId = await peerIdFor(req);
+      if (req.query.check === '1') {
+        const looked = hub.accessFile(routeParam(req, 'id'), routeParam(req, 'fileId'), peerId);
+        if ('error' in looked) {
+          shareLog('download refused', { request: requestId, result: looked.error ?? 'missing' });
+          sendShareError(res, looked.error ?? 'missing');
+          return;
+        }
+        res.json({ ok: true, mode: 'relay', size: looked.file.size });
+        return;
+      }
+      const started = hub.beginFile(routeParam(req, 'id'), routeParam(req, 'fileId'), peerId);
+      if (!('job' in started)) {
+        shareLog('download refused', { request: requestId, result: started.error ?? 'missing' });
         sendShareError(res, started.error ?? 'missing');
         return;
       }
+      shareLog('download relay', { request: requestId, transfer: started.job.id, share: routeParam(req, 'id'), file: routeParam(req, 'fileId') });
       const downloadName = started.file.relativePath.split('/').pop() ?? 'download';
       await pumpDownload(req, res, started.file.size, downloadName, () => hub.waitForFile(started.job, started.file.id), () => {
         hub.cancelDownload(started.job.id);
@@ -176,12 +206,27 @@ export function registerShareRoutes(
 
   app.get('/api/shares/:id/archive', requireAuth, async (req, res, next) => {
     try {
+      const requestId = randomUUID();
+      res.setHeader('X-Request-Id', requestId);
       const ids = typeof req.query.ids === 'string' && req.query.ids ? req.query.ids.split(',') : [];
-      const started = hub.beginZip(routeParam(req, 'id'), req.query.dir, ids, await peerIdFor(req));
-      if ('error' in started) {
+      const peerId = await peerIdFor(req);
+      if (req.query.check === '1') {
+        const looked = hub.accessZip(routeParam(req, 'id'), req.query.dir, ids, peerId);
+        if ('error' in looked) {
+          shareLog('archive refused', { request: requestId, result: looked.error ?? 'missing' });
+          sendShareError(res, looked.error ?? 'missing');
+          return;
+        }
+        res.json({ ok: true, mode: 'relay', files: looked.files.length });
+        return;
+      }
+      const started = hub.beginZip(routeParam(req, 'id'), req.query.dir, ids, peerId);
+      if (!('job' in started)) {
+        shareLog('archive refused', { request: requestId, result: started.error ?? 'missing' });
         sendShareError(res, started.error ?? 'missing');
         return;
       }
+      shareLog('archive relay', { request: requestId, transfer: started.job.id, share: routeParam(req, 'id'), files: started.files.length });
       const folder = typeof req.query.dir === 'string' ? req.query.dir : '';
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', attachmentDisposition('shared-folder.zip'));
@@ -258,9 +303,12 @@ async function pumpDownload(
     }
     if (seen !== size) throw new Error('The shared file ended early.');
     res.end();
-  } catch {
+  } catch (error) {
     stop();
-    if (!res.headersSent) res.status(502).json({ error: 'The sender did not finish this file.' });
+    const message = error instanceof Error && error.message.startsWith('The sender')
+      ? error.message
+      : 'The sender did not finish this file.';
+    if (!res.headersSent) res.status(502).json({ error: message });
     else res.destroy();
   }
 }
@@ -289,6 +337,10 @@ function zipEntryName(relativePath: string, dir: string): string {
   if (!dir) return relativePath;
   const prefix = `${dir}/`;
   return relativePath.startsWith(prefix) ? relativePath.slice(prefix.length) : relativePath;
+}
+
+function shareLog(event: string, fields: Record<string, string | number>): void {
+  console.log(JSON.stringify({ scope: 'share', event, ...fields }));
 }
 
 function routeParam(req: Request, name: string): string {

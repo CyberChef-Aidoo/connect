@@ -16,11 +16,15 @@ export type DirectSignal = {
   payload: string;
 };
 
+type BrowserPresence = { userId: string; peerId: string; seenAt: number };
+
 type Transfer = {
   id: string;
   fileId: string;
-  ownerId: string;
-  peerId: string;
+  ownerUserId: string;
+  requesterUserId: string;
+  requesterPeerId: string;
+  ownerPeerIds: string[];
   expiresAt: number;
 };
 
@@ -30,6 +34,7 @@ type PostResult =
 
 export type SignalInput = {
   fromUserId: string;
+  fromPeerId: string;
   fileOwnerId: string;
   fileId: string;
   toUserId: string;
@@ -39,21 +44,29 @@ export type SignalInput = {
 };
 
 export function createPeerHub() {
-  const seenAt = new Map<string, number>();
+  const browsers = new Map<string, BrowserPresence>();
   const transfers = new Map<string, Transfer>();
   const inbox = new Map<string, DirectSignal[]>();
 
-  function onlineIds(now = Date.now()): string[] {
-    const ids: string[] = [];
-    for (const [userId, at] of seenAt) {
-      if (now - at <= ONLINE_MS) ids.push(userId);
-      else seenAt.delete(userId);
+  function onlineBrowsers(now = Date.now()): BrowserPresence[] {
+    const list: BrowserPresence[] = [];
+    for (const [peerId, browser] of browsers) {
+      if (now - browser.seenAt > ONLINE_MS) browsers.delete(peerId);
+      else list.push(browser);
     }
-    return ids;
+    return list;
   }
 
-  function beat(userId: string, now = Date.now()): void {
-    seenAt.set(userId, now);
+  function onlineIds(now = Date.now()): string[] {
+    return [...new Set(onlineBrowsers(now).map((browser) => browser.userId))];
+  }
+
+  function beat(userId: string, peerId: string, now = Date.now()): void {
+    browsers.set(peerId, { userId, peerId, seenAt: now });
+  }
+
+  function browsersFor(userId: string, now: number): string[] {
+    return onlineBrowsers(now).filter((browser) => browser.userId === userId).map((browser) => browser.peerId);
   }
 
   function post(input: SignalInput, now = Date.now()): PostResult {
@@ -61,7 +74,7 @@ export function createPeerHub() {
     if (kind !== 'request' && kind !== 'offer' && kind !== 'answer' && kind !== 'ice' && kind !== 'reject') {
       return { ok: false, status: 400, error: 'Choose a direct-send message type.' };
     }
-    if (!ID_PATTERN.test(input.toUserId) || input.toUserId === input.fromUserId) {
+    if (!ID_PATTERN.test(input.toUserId) || !ID_PATTERN.test(input.fromPeerId)) {
       return { ok: false, status: 400, error: 'Choose who should receive this.' };
     }
     const payload = typeof input.payload === 'string' ? input.payload : '';
@@ -75,28 +88,32 @@ export function createPeerHub() {
       if (input.toUserId !== input.fileOwnerId) {
         return { ok: false, status: 403, error: 'Ask the person who uploaded the file.' };
       }
-      if (!isOnline(input.toUserId, now)) {
+      const targets = browsersFor(input.fileOwnerId, now).filter((peerId) => peerId !== input.fromPeerId);
+      if (targets.length === 0) {
         return { ok: false, status: 409, error: 'That person is not here.' };
       }
-      if (openCount(input.fromUserId, now) >= MAX_TRANSFERS) {
+      if (openCount(input.fromPeerId, now) >= MAX_TRANSFERS) {
         return { ok: false, status: 429, error: 'Too many direct sends are already open.' };
       }
       const transfer: Transfer = {
         id: crypto.randomUUID(),
         fileId: input.fileId,
-        ownerId: input.fileOwnerId,
-        peerId: input.fromUserId,
+        ownerUserId: input.fileOwnerId,
+        requesterUserId: input.fromUserId,
+        requesterPeerId: input.fromPeerId,
+        ownerPeerIds: targets,
         expiresAt: now + TRANSFER_MS,
       };
       transfers.set(transfer.id, transfer);
-      deliver({
+      const signal: DirectSignal = {
         transferId: transfer.id,
         fromUserId: input.fromUserId,
         toUserId: input.toUserId,
         fileId: input.fileId,
         kind,
         payload,
-      });
+      };
+      for (const peerId of targets) deliver(peerId, signal);
       return { ok: true, transferId: transfer.id };
     }
 
@@ -105,53 +122,52 @@ export function createPeerHub() {
     if (!transfer || transfer.expiresAt <= now || transfer.fileId !== input.fileId) {
       return { ok: false, status: 404, error: 'That direct send is no longer open.' };
     }
-    const party = input.fromUserId === transfer.ownerId || input.fromUserId === transfer.peerId;
-    const other = input.fromUserId === transfer.ownerId ? transfer.peerId : transfer.ownerId;
-    if (!party || input.toUserId !== other) {
+    const fromOwner = transfer.ownerPeerIds.includes(input.fromPeerId);
+    const fromRequester = input.fromPeerId === transfer.requesterPeerId;
+    if (!fromOwner && !fromRequester) {
       return { ok: false, status: 403, error: 'That direct send is for someone else.' };
     }
-    if ((kind === 'offer' || kind === 'reject') && input.fromUserId !== transfer.ownerId) {
+    if ((kind === 'offer' || kind === 'reject') && !fromOwner) {
       return { ok: false, status: 403, error: 'Only the uploader can offer this file.' };
     }
-    if (kind === 'answer' && input.fromUserId !== transfer.peerId) {
+    if (kind === 'answer' && !fromRequester) {
       return { ok: false, status: 403, error: 'Only the receiver can answer.' };
     }
-    deliver({
+    const targets = fromOwner
+      ? [transfer.requesterPeerId]
+      : transfer.ownerPeerIds.filter((peerId) => peerId !== input.fromPeerId);
+    const signal: DirectSignal = {
       transferId: transfer.id,
       fromUserId: input.fromUserId,
       toUserId: input.toUserId,
       fileId: input.fileId,
       kind,
       payload,
-    });
+    };
+    for (const peerId of targets) deliver(peerId, signal);
     return { ok: true, transferId: transfer.id };
   }
 
-  function take(userId: string): DirectSignal[] {
-    const queued = inbox.get(userId) ?? [];
-    inbox.delete(userId);
+  function take(peerId: string): DirectSignal[] {
+    const queued = inbox.get(peerId) ?? [];
+    inbox.delete(peerId);
     return queued;
   }
 
-  function isOnline(userId: string, now: number): boolean {
-    const at = seenAt.get(userId);
-    return at !== undefined && now - at <= ONLINE_MS;
-  }
-
-  function openCount(userId: string, now: number): number {
+  function openCount(peerId: string, now: number): number {
     let count = 0;
     for (const [id, transfer] of transfers) {
       if (transfer.expiresAt <= now) transfers.delete(id);
-      else if (transfer.peerId === userId || transfer.ownerId === userId) count += 1;
+      else if (transfer.requesterPeerId === peerId || transfer.ownerPeerIds.includes(peerId)) count += 1;
     }
     return count;
   }
 
-  function deliver(signal: DirectSignal): void {
-    const queued = inbox.get(signal.toUserId) ?? [];
+  function deliver(peerId: string, signal: DirectSignal): void {
+    const queued = inbox.get(peerId) ?? [];
     queued.push(signal);
-    inbox.set(signal.toUserId, queued.slice(-MAX_INBOX));
+    inbox.set(peerId, queued.slice(-MAX_INBOX));
   }
 
-  return { beat, onlineIds, post, take };
+  return { beat, onlineIds, onlineBrowsers, post, take };
 }

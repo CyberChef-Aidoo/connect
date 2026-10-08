@@ -119,13 +119,14 @@ export function createDirectHub() {
 
   async function answerRequest(signal: DirectSignal, csrf: string): Promise<void> {
     const file = localFile(signal.fileId);
-    if (!file || file.size > DIRECT_MAX_BYTES) {
+    if (!file) return;
+    if (file.size > DIRECT_MAX_BYTES) {
       await postSignal({
         fileId: signal.fileId,
         toUserId: signal.fromUserId,
         kind: 'reject',
         transferId: signal.transferId,
-        payload: JSON.stringify({ reason: file ? 'too-large' : 'away' }),
+        payload: JSON.stringify({ reason: 'too-large' }),
       }, csrf);
       return;
     }

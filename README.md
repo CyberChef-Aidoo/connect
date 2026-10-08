@@ -194,10 +194,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\register-logon-task.ps1
 
 Sign in after a reboot, or leave that account signed in on a computer you use as the server. The task does not run as SYSTEM, and it does not start while the user is signed out.
 
+If the computer must serve files before anyone signs in, register the startup task instead. It uses S4U, so Windows does not store a password. The process can read local files. It does not receive network credentials, and it does not run as SYSTEM:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register-startup-task.ps1
+```
+
 Remove it later with:
 
 ```powershell
 Unregister-ScheduledTask -TaskName SharedFilePortal -Confirm:$false
+Unregister-ScheduledTask -TaskName SharedFilePortalService -Confirm:$false
 ```
 
 You can also start it by hand with `.\scripts\start-portal.ps1`.
