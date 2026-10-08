@@ -356,11 +356,10 @@ function openDownloadTrack(
   input: { filename: string; kind: 'relay' | 'relay-zip'; totalBytes: number | null; sourceTotal: number | null },
 ): string | null {
   const id = readProgressId(req.query.progress);
-  const userId = req.session.userId;
-  if (!id || !userId) return null;
+  if (!id || !req.sessionID) return null;
   const opened = tracker.open({
     id,
-    userId,
+    sessionId: req.sessionID,
     filename: input.filename,
     kind: input.kind,
     totalBytes: input.totalBytes,

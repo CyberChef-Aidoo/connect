@@ -198,12 +198,38 @@ export async function takeShareSignals(): Promise<ShareSignal[]> {
   return body.signals;
 }
 
-export async function sendSharedBytes(jobId: string, fileId: string, file: File, csrf: string): Promise<void> {
-  const response = await fetch(apiUrl(`/api/shares/outbox/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileId)}`), {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/octet-stream', 'X-CSRF-Token': csrf },
-    body: file,
+export function sendSharedBytes(
+  jobId: string,
+  fileId: string,
+  file: File,
+  csrf: string,
+  onProgress?: (sentBytes: number, totalBytes: number) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', apiUrl(`/api/shares/outbox/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileId)}`));
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-CSRF-Token', csrf);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(event.loaded, event.total || file.size);
+    };
+    xhr.upload.onload = () => onProgress?.(file.size, file.size);
+    xhr.onload = () => {
+      try {
+        const body = xhr.responseText ? JSON.parse(xhr.responseText) as { ok?: boolean; error?: unknown } : {};
+        if (xhr.status === 200 && body.ok === true) {
+          resolve();
+          return;
+        }
+        const message = typeof body.error === 'string' && body.error.trim() ? body.error : 'The share request was refused.';
+        reject(new ApiError(xhr.status, message));
+      } catch {
+        reject(new ApiError(xhr.status || 502, 'The server sent an unexpected response.'));
+      }
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'Cannot reach the server. Check that it is running and try again.'));
+    xhr.onabort = () => reject(new ApiError(0, 'Upload canceled.'));
+    xhr.send(file);
   });
-  await readJson(response);
 }

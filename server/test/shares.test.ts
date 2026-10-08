@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -98,7 +99,8 @@ describe('read-only shares', () => {
       const fileId = shared.body.files[0].id as string;
       const shareId = shared.body.share.id as string;
 
-      const download = get(base, blake, `/api/shares/${shareId}/files/${fileId}`);
+      const progressId = randomUUID();
+      const download = get(base, blake, `/api/shares/${shareId}/files/${fileId}?progress=${progressId}`);
       const job = await waitForJob(base, ada);
       const uploaded = await fetch(`${base}/api/shares/outbox/${job.id}/files/${fileId}`, {
         method: 'POST',
@@ -115,6 +117,16 @@ describe('read-only shares', () => {
       assert.equal(received.status, 200);
       assert.equal(received.headers.get('x-transfer-mode'), 'relay');
       assert.equal(await received.text(), 'hello');
+      const progress = await fetch(`${base}/api/transfers/${progressId}`, { headers: { Cookie: blake.cookie } });
+      assert.equal(progress.status, 200);
+      const progressBody = await progress.json() as { sentBytes: number; uploadBytes: number; savedBytes: null; totalBytes: number; done: boolean };
+      assert.equal(progressBody.sentBytes, 5);
+      assert.equal(progressBody.uploadBytes, 5);
+      assert.equal(progressBody.savedBytes, null);
+      assert.equal(progressBody.totalBytes, 5);
+      assert.equal(progressBody.done, true);
+      const hiddenProgress = await fetch(`${base}/api/transfers/${progressId}`, { headers: { Cookie: ada.cookie } });
+      assert.equal(hiddenProgress.status, 404);
 
       const revoked = await fetch(`${base}/api/shares/${shareId}`, {
         method: 'DELETE',
@@ -160,6 +172,7 @@ describe('read-only shares', () => {
       const received = await download;
       assert.equal(received.status, 200);
       assert.equal(received.headers.get('x-transfer-mode'), 'relay');
+      assert.equal(received.headers.get('content-length'), null);
       const bytes = Buffer.from(await received.arrayBuffer());
       assert.equal(bytes.subarray(0, 2).toString(), 'PK');
       assert.equal(bytes.includes(Buffer.from('one')), true);

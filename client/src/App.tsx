@@ -46,11 +46,13 @@ import { rememberLocalFile } from './localFiles';
 import { formatBytes, formatWhen } from './format';
 import { FileCards, FileGrid, FileTable, LibraryToolbar, useMediaQuery } from './libraryView';
 import { selectionMatchesSession } from './resumeMatch';
-import { formatRemaining, formatSpeed, rememberSample, transferView, type TransferSample } from './transfer';
+import { startBrowserDownload, type DownloadWatch } from './browserDownload';
+import { TransferCards, type TransferCardModel } from './transferCards';
+import { explainTransferFailure, formatRemaining, formatSpeed, rememberSample, shouldPaint, transferView, type TransferActivity, type TransferSample } from './transfer';
 
 type SortValue = 'date:desc' | 'date:asc' | 'name:asc' | 'name:desc' | 'size:desc' | 'size:asc';
 
-type UploadStatus = 'queued' | 'uploading' | 'done' | 'error' | 'canceled';
+type UploadStatus = 'queued' | 'uploading' | 'finishing' | 'done' | 'error' | 'lost' | 'canceled';
 
 type UploadItem = {
   id: string;
@@ -59,6 +61,8 @@ type UploadItem = {
   sessionId: string | null;
   folderId: string | null;
   loaded: number;
+  sentBytes: number;
+  confirmedBytes: number;
   total: number;
   progress: number;
   status: UploadStatus;
@@ -236,7 +240,13 @@ function Dashboard({
   const [takingId, setTakingId] = useState<string | null>(null);
   const [desk, setDesk] = useState<'share' | 'library'>('share');
   const [concurrency, setConcurrency] = useState(() => readConcurrency(session.uploads.maxPerUser));
-  const direct = useRef(createDirectHub());
+  const directSendEvents = useRef<(event: { id: string; filename: string; progress: { sentBytes: number; confirmedBytes: number; totalBytes: number }; status: 'sending' | 'finishing' | 'completed' | 'lost' }) => void>(() => undefined);
+  const direct = useRef(createDirectHub({ onSend: (event) => directSendEvents.current(event) }));
+  const paintAt = useRef(new Map<string, { at: number; status: string }>());
+  const downloadCancels = useRef(new Map<string, () => void>());
+  const downloadTargets = useRef(new Map<string, { href: string; filename: string }>());
+  const [downloadCards, setDownloadCards] = useState<TransferCardModel[]>([]);
+  directSendEvents.current = (event) => rememberDirect(event);
   const started = useRef(new Set<string>());
   const controllers = useRef(new Map<string, AbortController>());
   const csrf = session.csrfToken;
@@ -299,7 +309,7 @@ function Dashboard({
 
   useEffect(() => {
     const onLeave = (event: BeforeUnloadEvent) => {
-      if (!uploads.some((item) => item.status === 'uploading' || item.status === 'queued')) return;
+      if (!uploads.some((item) => item.status === 'uploading' || item.status === 'finishing' || item.status === 'queued')) return;
       sessionStorage.setItem(ABANDONED_UPLOADS, '1');
       event.preventDefault();
     };
@@ -412,11 +422,11 @@ function Dashboard({
   }, [csrf]);
 
   useEffect(() => {
-    if (!uploads.some((item) => item.status === 'uploading')) return undefined;
+    if (!uploads.some((item) => item.status === 'uploading' || item.status === 'finishing')) return undefined;
     const timer = window.setInterval(() => {
       const now = Date.now();
       setUploads((current) => current.map((entry) => {
-        if (entry.status !== 'uploading') return entry;
+        if (entry.status !== 'uploading' && entry.status !== 'finishing') return entry;
         const view = transferView({
           loaded: entry.loaded,
           total: entry.total,
@@ -431,7 +441,7 @@ function Dashboard({
   }, [statusSummary]);
 
   useEffect(() => {
-    const room = Math.min(concurrency, pageCap) - uploads.filter((item) => item.status === 'uploading').length;
+    const room = Math.min(concurrency, pageCap) - uploads.filter((item) => item.status === 'uploading' || item.status === 'finishing').length;
     if (room <= 0) return;
     const waiting = uploads.filter((item) => item.status === 'queued' && !started.current.has(item.id)).slice(0, room);
     if (waiting.length === 0) return;
@@ -458,20 +468,27 @@ function Dashboard({
       samples: [{ at: startedAt, loaded: item.loaded }],
     }));
     try {
-      const saved = await uploadFile(item.file, csrf, (loaded, total) => {
+      const saved = await uploadFile(item.file, csrf, (tick) => {
         const now = Date.now();
+        const previous = paintAt.current.get(item.id);
+        const force = !previous || previous.status !== tick.phase;
+        if (!shouldPaint(previous?.at ?? 0, now, force)) return;
+        paintAt.current.set(item.id, { at: now, status: tick.phase });
         patchUpload(item.id, attempt, (entry) => {
-          const samples = rememberSample(entry.samples, { at: now, loaded });
-          const view = transferView({ loaded, total, now, samples, active: true });
+          const samples = rememberSample(entry.samples, { at: now, loaded: tick.sentBytes });
+          const view = transferView({ loaded: tick.sentBytes, total: tick.totalBytes, now, samples, active: true });
           return {
             ...entry,
-            loaded,
-            total,
+            loaded: tick.confirmedBytes,
+            sentBytes: tick.sentBytes,
+            confirmedBytes: tick.confirmedBytes,
+            total: tick.totalBytes,
             samples,
             progress: view.progress,
             bytesPerSecond: view.bytesPerSecond,
             remainingMs: view.remainingMs,
             stalled: view.stalled,
+            status: tick.phase === 'finishing' ? 'finishing' : 'uploading',
           };
         });
       }, controller.signal, {
@@ -495,6 +512,8 @@ function Dashboard({
         status: 'done',
         progress: 100,
         loaded: entry.total || entry.file.size,
+        sentBytes: entry.total || entry.file.size,
+        confirmedBytes: entry.total || entry.file.size,
         message: 'Uploaded',
         stalled: false,
         remainingMs: null,
@@ -504,13 +523,17 @@ function Dashboard({
       await loadPending();
     } catch (caught) {
       const canceled = caught instanceof ApiError && caught.message === 'Upload canceled.';
+      const failure = explainTransferFailure(
+        caught instanceof ApiError ? caught.status : 0,
+        caught instanceof Error ? caught.message : 'The connection was lost. Try again.',
+      );
       setUploads((current) => current.map((entry) => (
         entry.id === item.id && entry.attempt === attempt
           ? {
             ...entry,
-            status: canceled ? 'canceled' : 'error',
+            status: canceled ? 'canceled' : failure.status === 'lost' ? 'lost' : 'error',
             stalled: false,
-            message: canceled ? 'Canceled' : (caught instanceof Error ? caught.message : 'Upload failed.'),
+            message: canceled ? 'Canceled' : failure.message,
           }
           : entry
       )));
@@ -563,6 +586,8 @@ function Dashboard({
         sessionId: null,
         folderId: target,
         loaded: 0,
+        sentBytes: 0,
+        confirmedBytes: 0,
         total: file.size,
         progress: 0,
         status: tooBig ? 'error' : 'queued',
@@ -592,6 +617,8 @@ function Dashboard({
       sessionId: upload.id,
       folderId: null,
       loaded: upload.receivedBytes,
+      sentBytes: upload.receivedBytes,
+      confirmedBytes: upload.receivedBytes,
       total: file.size,
       progress,
       status: 'queued',
@@ -610,7 +637,7 @@ function Dashboard({
     if (controller) controller.abort();
     if (item?.sessionId) void discardSession(item.sessionId);
     setUploads((current) => current.map((entry) => (
-      entry.id === id && (entry.status === 'queued' || entry.status === 'uploading')
+      entry.id === id && (entry.status === 'queued' || entry.status === 'uploading' || entry.status === 'finishing')
         ? { ...entry, status: 'canceled', message: 'Canceled', sessionId: null }
         : entry
     )));
@@ -631,6 +658,8 @@ function Dashboard({
         message: 'Waiting',
         progress,
         loaded: keep ? item.loaded : 0,
+        sentBytes: keep ? item.sentBytes : 0,
+        confirmedBytes: keep ? item.confirmedBytes : 0,
         samples: [],
         bytesPerSecond: null,
         remainingMs: null,
@@ -842,20 +871,156 @@ function Dashboard({
     return browsers.some((browser) => browser.userId === file.ownerId && browser.peerId !== selfPeerId);
   }
 
+  function rememberCard(card: TransferCardModel) {
+    const now = Date.now();
+    const previous = paintAt.current.get(card.id);
+    const force = !previous || previous.status !== card.status;
+    if (!shouldPaint(previous?.at ?? 0, now, force)) return;
+    paintAt.current.set(card.id, { at: now, status: card.status });
+    setDownloadCards((current) => {
+      const index = current.findIndex((item) => item.id === card.id);
+      if (index < 0) return [card, ...current];
+      const next = current.slice();
+      next[index] = card;
+      return next;
+    });
+  }
+
+  function downloadCard(watch: DownloadWatch): TransferCardModel {
+    const relay = watch.kind === 'relay' || watch.kind === 'relay-zip';
+    const packed = watch.sourceTotal !== null && watch.kind.endsWith('zip')
+      ? `Read ${formatBytes(watch.sourceBytes)} of ${formatBytes(watch.sourceTotal)} from the files.`
+      : '';
+    const saved = watch.status === 'completed'
+      ? 'This page cannot confirm the file was saved.'
+      : 'Saved: not confirmed.';
+    return {
+      id: watch.id,
+      filename: watch.filename,
+      direction: 'download',
+      status: watch.status,
+      totalBytes: watch.totalBytes,
+      transferredBytes: watch.sentBytes,
+      confirmedBytes: null,
+      detail: [relay ? `Received from the other browser: ${formatBytes(watch.uploadBytes)}.` : '', `Sent ${formatBytes(watch.sentBytes)}. ${saved}`, packed].filter(Boolean).join(' '),
+      error: watch.error,
+      speed: '',
+      remaining: '',
+      canCancel: watch.status === 'sending' || watch.status === 'downloading' || watch.status === 'finishing',
+      canRetry: watch.status === 'lost' || watch.status === 'retry',
+    };
+  }
+
+  function rememberDirect(event: { id: string; filename: string; progress: { sentBytes: number; confirmedBytes: number; totalBytes: number }; status: 'sending' | 'finishing' | 'completed' | 'lost' }) {
+    rememberCard({
+      id: event.id,
+      filename: event.filename,
+      direction: 'upload',
+      status: event.status,
+      totalBytes: event.progress.totalBytes,
+      transferredBytes: event.progress.sentBytes,
+      confirmedBytes: event.progress.confirmedBytes,
+      detail: 'Confirmed means the other browser has received these bytes.',
+      error: event.status === 'lost' ? 'The connection was lost. Use Download.' : null,
+      speed: '',
+      remaining: '',
+      canCancel: false,
+      canRetry: false,
+    });
+  }
+
+  function beginDownload(href: string, filename: string) {
+    const startedDownload = startBrowserDownload({
+      href,
+      filename,
+      csrf,
+      onUpdate: (watch) => rememberCard(downloadCard(watch)),
+    });
+    downloadCancels.current.set(startedDownload.id, startedDownload.cancel);
+    downloadTargets.current.set(startedDownload.id, { href, filename });
+  }
+
+  function retryDownload(id: string) {
+    const target = downloadTargets.current.get(id);
+    if (!target) return;
+    beginDownload(target.href, target.filename);
+  }
+
   async function takeDirect(file: PortalFile) {
     setListError('');
     setTakingId(file.id);
+    const cardId = `direct-${file.id}`;
+    rememberCard({
+      id: cardId,
+      filename: file.originalName,
+      direction: 'download',
+      status: 'downloading',
+      totalBytes: file.sizeBytes,
+      transferredBytes: 0,
+      confirmedBytes: 0,
+      detail: 'Receiving from the other browser.',
+      error: null,
+      speed: '',
+      remaining: '',
+      canCancel: false,
+      canRetry: false,
+    });
     try {
-      const blob = await direct.current.requestFile(file.id, file.ownerId, csrf);
+      const blob = await direct.current.requestFile(file.id, file.ownerId, csrf, {
+        onProgress: (received, total) => rememberCard({
+          id: cardId,
+          filename: file.originalName,
+          direction: 'download',
+          status: received >= total ? 'finishing' : 'downloading',
+          totalBytes: total,
+          transferredBytes: received,
+          confirmedBytes: received,
+          detail: 'These bytes have arrived in this tab.',
+          error: null,
+          speed: '',
+          remaining: '',
+          canCancel: false,
+          canRetry: false,
+        }),
+      });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
       link.download = file.originalName;
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setBanner(`Received ${file.originalName} directly.`);
+      rememberCard({
+        id: cardId,
+        filename: file.originalName,
+        direction: 'download',
+        status: 'completed',
+        totalBytes: file.sizeBytes,
+        transferredBytes: file.sizeBytes,
+        confirmedBytes: file.sizeBytes,
+        detail: 'Received in this tab. Your browser was asked to save a copy. This page cannot confirm that save.',
+        error: null,
+        speed: '',
+        remaining: '',
+        canCancel: false,
+        canRetry: false,
+      });
     } catch (caught) {
-      setListError(caught instanceof Error ? caught.message : 'Direct send is not available. Use Download.');
+      const failure = explainTransferFailure(0, caught instanceof Error ? caught.message : 'The connection was lost. Use Download.');
+      rememberCard({
+        id: cardId,
+        filename: file.originalName,
+        direction: 'download',
+        status: failure.status,
+        totalBytes: file.sizeBytes,
+        transferredBytes: 0,
+        confirmedBytes: null,
+        detail: '',
+        error: failure.message,
+        speed: '',
+        remaining: '',
+        canCancel: false,
+        canRetry: false,
+      });
     } finally {
       setTakingId(null);
     }
@@ -884,6 +1049,7 @@ function Dashboard({
     canDirect,
     takingId,
     onDirect: (file: PortalFile) => void takeDirect(file),
+    onDownload: (href: string, filename: string) => beginDownload(href, filename),
   };
   const storage = listing?.storage;
   const ratio = storage && storage.limitBytes > 0 ? Math.min(1, storage.usedBytes / storage.limitBytes) : 0;
@@ -910,6 +1076,11 @@ function Dashboard({
         <button type="button" role="tab" aria-selected={desk === 'library'} onClick={() => setDesk('library')}>Library</button>
       </div>
       <ShareDesk csrf={csrf} hidden={desk !== 'share'} />
+      <TransferCards
+        items={downloadCards}
+        onCancel={(id) => downloadCancels.current.get(id)?.()}
+        onRetry={retryDownload}
+      />
       <div hidden={desk !== 'library'}>
 
       <section className="storage" aria-label="Storage">
@@ -968,7 +1139,9 @@ function Dashboard({
               ) : (
                 <button type="button" className="danger" onClick={() => setConfirmBulkDelete(true)}>Delete selected</button>
               )}
-              {selected.length <= 100 ? <a className="button" href={zipUrl(selected)}>Download zip</a> : <span className="bulk-note">Choose 100 files or fewer for a zip.</span>}
+              {selected.length <= 100 ? (
+                <a className="button" href={zipUrl(selected)} onClick={(event) => { event.preventDefault(); beginDownload(zipUrl(selected), 'portal-files.zip'); }}>Download zip</a>
+              ) : <span className="bulk-note">Choose 100 files or fewer for a zip.</span>}
             </div>
             <div className="bulk-actions">
               <input
@@ -1042,7 +1215,7 @@ function Dashboard({
         ) : (
           <FileTable {...fileListProps} onTogglePage={togglePage} />
         )}
-        <PreviewDialog file={previewing} onClose={() => setPreviewing(null)} />
+        <PreviewDialog file={previewing} onClose={() => setPreviewing(null)} onDownload={beginDownload} />
         <div className="pager">
           <button type="button" className="ghost" disabled={cursorStack.length === 0} onClick={showPrevious}>Previous</button>
           <button type="button" className="ghost" disabled={!listing?.page?.nextCursor} onClick={showNext}>Next</button>
@@ -1218,52 +1391,43 @@ function UploadZone({
             </label>
             {finished ? <button type="button" className="ghost" onClick={onClear}>Clear finished</button> : null}
           </div>
-          <ul>
-            {uploads.map((item) => {
-              const speed = formatSpeed(item.bytesPerSecond);
-              const remaining = item.status === 'uploading' ? formatRemaining(item.remainingMs, item.stalled) : '';
-              const amount = item.status === 'uploading' || (item.sessionId && item.loaded > 0)
-                ? `${formatBytes(item.loaded)} of ${formatBytes(item.total)}`
-                : formatBytes(item.file.size);
-              const detail = [amount, speed, remaining]
-                .filter(Boolean)
-                .join(' Â· ');
-              return (
-                <li key={item.id}>
-                  <div className="queue-row">
-                    <span className="filename">{item.file.name}</span>
-                    <span className="meta">{detail}</span>
-                    {item.status === 'queued' || item.status === 'uploading' ? (
-                      <button type="button" className="ghost" onClick={() => onCancel(item.id)}>Cancel</button>
-                    ) : (
-                      <span className={`pill ${item.status}`}>{item.message}</span>
-                    )}
-                    {item.status === 'error' || item.status === 'canceled' ? (
-                      <button type="button" className="ghost" onClick={() => onRetry(item.id)}>Retry</button>
-                    ) : null}
-                  </div>
-                  {item.status === 'uploading' || item.status === 'queued' ? (
-                    <div
-                      className="bar"
-                      role="progressbar"
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={item.progress}
-                      aria-valuetext={detail}
-                      aria-label={`Upload progress for ${item.file.name}`}
-                    >
-                      <span style={{ width: `${item.status === 'queued' ? 0 : item.progress}%` }} />
-                    </div>
-                  ) : null}
-                  {item.status === 'error' ? <p className="fail" role="alert">{item.message}</p> : null}
-                </li>
-              );
-            })}
-          </ul>
+          <TransferCards
+            items={uploads.map((item) => ({
+              id: item.id,
+              filename: item.file.name,
+              direction: 'upload' as const,
+              status: uploadActivity(item.status),
+              totalBytes: item.total,
+              transferredBytes: item.sentBytes,
+              confirmedBytes: item.confirmedBytes,
+              detail: item.status === 'done'
+                ? 'This computer has saved the file.'
+                : item.sentBytes > item.confirmedBytes
+                  ? 'Sent is ahead of the bytes this computer has saved.'
+                  : '',
+              error: item.status === 'error' || item.status === 'lost' ? item.message : null,
+              speed: formatSpeed(item.bytesPerSecond),
+              remaining: item.status === 'uploading' || item.status === 'finishing' ? formatRemaining(item.remainingMs, item.stalled) : '',
+              canCancel: item.status === 'queued' || item.status === 'uploading' || item.status === 'finishing',
+              canRetry: item.status === 'error' || item.status === 'lost' || item.status === 'canceled',
+            }))}
+            onCancel={onCancel}
+            onRetry={onRetry}
+          />
         </div>
       ) : null}
     </section>
   );
+}
+
+function uploadActivity(status: UploadStatus): TransferActivity {
+  if (status === 'uploading') return 'sending';
+  if (status === 'finishing') return 'finishing';
+  if (status === 'done') return 'completed';
+  if (status === 'lost') return 'lost';
+  if (status === 'canceled') return 'canceled';
+  if (status === 'error') return 'retry';
+  return 'queued';
 }
 
 function readConcurrency(serverCap: number): number {
@@ -1478,9 +1642,11 @@ function BinPanel({
 function PreviewDialog({
   file,
   onClose,
+  onDownload,
 }: {
   file: PortalFile | null;
   onClose: () => void;
+  onDownload: (href: string, filename: string) => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [text, setText] = useState('');
@@ -1549,7 +1715,15 @@ function PreviewDialog({
           {file.preview === 'text' && !error ? <pre>{text}</pre> : null}
           {truncated ? <p className="meta">Showing the first 256 KB. Download the file for the rest.</p> : null}
           <div className="actions">
-            <a href={`/api/files/${encodeURIComponent(file.id)}/download`}>Download</a>
+            <a
+              href={`/api/files/${encodeURIComponent(file.id)}/download`}
+              onClick={(event) => {
+                event.preventDefault();
+                onDownload(`/api/files/${encodeURIComponent(file.id)}/download`, file.originalName);
+              }}
+            >
+              Download
+            </a>
             <button type="button" className="ghost" onClick={onClose}>Close</button>
           </div>
         </>

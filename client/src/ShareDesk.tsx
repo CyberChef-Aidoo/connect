@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { randomId } from './randomId';
 import { browsersHere, connectionPlain, explainRejected, explainShareError, supportDetails, transferLabel } from './shareCopy';
+import { startBrowserDownload, type DownloadWatch } from './browserDownload';
 import { formatBytes } from './format';
 import { createShareDirect, directShareAvailable } from './shareDirect';
+import { shouldPaint } from './transfer';
+import { TransferCards, type TransferCardModel } from './transferCards';
 import {
   abortOutbox,
   browseShare,
@@ -34,7 +37,12 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   const folderOk = folderSelectionAvailable();
   const filesRef = useRef(new Map<string, File>());
   const sending = useRef(new Set<string>());
-  const direct = useRef(createShareDirect((id) => filesRef.current.get(id)));
+  const onDirectSend = useRef<(event: { id: string; filename: string; progress: { sentBytes: number; confirmedBytes: number; totalBytes: number }; status: 'sending' | 'finishing' | 'completed' | 'lost' }) => void>(() => undefined);
+  const direct = useRef(createShareDirect((id) => filesRef.current.get(id), { onSend: (event) => onDirectSend.current(event) }));
+  const paintAt = useRef(new Map<string, { at: number; status: string }>());
+  const downloadCancels = useRef(new Map<string, () => void>());
+  const [cards, setCards] = useState<TransferCardModel[]>([]);
+  onDirectSend.current = (event) => rememberCard(directSendCard(event));
   const directAbort = useRef<AbortController | null>(null);
   const [nameOnNetwork, setNameOnNetwork] = useState(() => localStorage.getItem(NAME_KEY) || 'This browser');
   const [people, setPeople] = useState<SharePerson[]>([]);
@@ -116,8 +124,40 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
             }
             sending.current.add(key);
             console.info('portal transfer', { transfer: job.id, file: job.nextFileId, mode: 'relay', bytes: file.size });
+            const cardId = `relay-send-${job.id}-${job.nextFileId}`;
             try {
-              await sendSharedBytes(job.id, job.nextFileId, file, csrf);
+              await sendSharedBytes(job.id, job.nextFileId, file, csrf, (sent, total) => {
+                rememberCard({
+                  id: cardId,
+                  filename: file.name,
+                  direction: 'upload',
+                  status: sent >= total ? 'finishing' : 'sending',
+                  totalBytes: total,
+                  transferredBytes: sent,
+                  confirmedBytes: 0,
+                  detail: 'Sending to this computer. The other browser has not confirmed a saved copy.',
+                  error: null,
+                  speed: '',
+                  remaining: '',
+                  canCancel: false,
+                  canRetry: false,
+                });
+              });
+              rememberCard({
+                id: cardId,
+                filename: file.name,
+                direction: 'upload',
+                status: 'completed',
+                totalBytes: file.size,
+                transferredBytes: file.size,
+                confirmedBytes: file.size,
+                detail: 'This computer accepted the file. A copy saved by the other browser cannot be confirmed here.',
+                error: null,
+                speed: '',
+                remaining: '',
+                canCancel: false,
+                canRetry: false,
+              });
             } catch {
               // The next poll retries while the download is still waiting.
             } finally {
@@ -240,6 +280,66 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     }
   }
 
+  function rememberCard(card: TransferCardModel) {
+    const now = Date.now();
+    const previous = paintAt.current.get(card.id);
+    const force = !previous || previous.status !== card.status;
+    if (!shouldPaint(previous?.at ?? 0, now, force)) return;
+    paintAt.current.set(card.id, { at: now, status: card.status });
+    setCards((current) => {
+      const index = current.findIndex((item) => item.id === card.id);
+      if (index < 0) return [card, ...current];
+      const next = current.slice();
+      next[index] = card;
+      return next;
+    });
+  }
+
+  function directSendCard(event: { id: string; filename: string; progress: { sentBytes: number; confirmedBytes: number; totalBytes: number }; status: 'sending' | 'finishing' | 'completed' | 'lost' }): TransferCardModel {
+    return {
+      id: event.id,
+      filename: event.filename,
+      direction: 'upload',
+      status: event.status,
+      totalBytes: event.progress.totalBytes,
+      transferredBytes: event.progress.sentBytes,
+      confirmedBytes: event.progress.confirmedBytes,
+      detail: 'Confirmed means the other browser has received these bytes.',
+      error: event.status === 'lost' ? 'The connection was lost. Use Download.' : null,
+      speed: '',
+      remaining: '',
+      canCancel: false,
+      canRetry: false,
+    };
+  }
+
+  function shareDownloadCard(watch: DownloadWatch): TransferCardModel {
+    const relay = watch.kind === 'relay' || watch.kind === 'relay-zip';
+    const packed = watch.sourceTotal !== null && watch.kind.endsWith('zip')
+      ? `Read ${formatBytes(watch.sourceBytes)} of ${formatBytes(watch.sourceTotal)} from the files.`
+      : '';
+    return {
+      id: watch.id,
+      filename: watch.filename,
+      direction: 'download',
+      status: watch.status,
+      totalBytes: watch.totalBytes,
+      transferredBytes: watch.sentBytes,
+      confirmedBytes: null,
+      detail: [
+        relay ? `Received from the other browser: ${formatBytes(watch.uploadBytes)}.` : '',
+        `Sent ${formatBytes(watch.sentBytes)}. Saved: not confirmed.`,
+        packed,
+        watch.status === 'completed' ? 'This page cannot confirm the file was saved.' : '',
+      ].filter(Boolean).join(' '),
+      error: watch.error,
+      speed: '',
+      remaining: '',
+      canCancel: watch.status === 'sending' || watch.status === 'downloading' || watch.status === 'finishing',
+      canRetry: false,
+    };
+  }
+
   function cancelDirect() {
     directAbort.current?.abort();
   }
@@ -249,14 +349,43 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     const controller = new AbortController();
     directAbort.current = controller;
     const label = file.relativePath.split('/').pop() ?? 'download';
-    setBusy(`Receiving ${label}…`);
+    const cardId = `direct-${file.id}`;
     setTransferMode('direct');
     setError('');
     console.info('portal transfer', { share: share.id, file: file.id, mode: 'direct' });
+    rememberCard({
+      id: cardId,
+      filename: label,
+      direction: 'download',
+      status: 'downloading',
+      totalBytes: file.size,
+      transferredBytes: 0,
+      confirmedBytes: 0,
+      detail: 'Receiving from the other browser.',
+      error: null,
+      speed: '',
+      remaining: '',
+      canCancel: true,
+      canRetry: false,
+    });
     try {
       const blob = await direct.current.receive(share.id, file.id, share.ownerPeerId, csrf, {
         signal: controller.signal,
-        onProgress: (received, total) => setBusy(`Receiving ${label}: ${formatBytes(received)} of ${formatBytes(total)}`),
+        onProgress: (received, total) => rememberCard({
+          id: cardId,
+          filename: label,
+          direction: 'download',
+          status: received >= total ? 'finishing' : 'downloading',
+          totalBytes: total,
+          transferredBytes: received,
+          confirmedBytes: received,
+          detail: 'These bytes have arrived in this tab.',
+          error: null,
+          speed: '',
+          remaining: '',
+          canCancel: true,
+          canRetry: false,
+        }),
       });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -264,7 +393,22 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       link.download = file.relativePath.split('/').pop() ?? 'download';
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setMessage(`Received ${link.download} from their browser.`);
+      setMessage(`Received ${link.download} in this tab. Your browser was asked to save a copy. This page cannot confirm that save.`);
+      rememberCard({
+        id: cardId,
+        filename: label,
+        direction: 'download',
+        status: 'completed',
+        totalBytes: file.size,
+        transferredBytes: file.size,
+        confirmedBytes: file.size,
+        detail: 'Received in this tab. Your browser was asked to save a copy. This page cannot confirm that save.',
+        error: null,
+        speed: '',
+        remaining: '',
+        canCancel: false,
+        canRetry: false,
+      });
       setTransferMode('idle');
     } catch (caught) {
       setTransferMode('idle');
@@ -283,13 +427,14 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     try {
       await confirmRelay(href);
       console.info('portal transfer', { mode: 'download', url: new URL(href).pathname });
-      const link = document.createElement('a');
-      link.href = href;
-      link.rel = 'noopener';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setMessage('The download was sent to your browser’s download list. Cancel it there to stop. A folder is sent as a zip and is not kept here.');
+      const started = startBrowserDownload({
+        href,
+        filename: 'Download',
+        csrf,
+        onUpdate: (watch) => rememberCard(shareDownloadCard(watch)),
+      });
+      downloadCancels.current.set(started.id, started.cancel);
+      setMessage('The download has started. Sent bytes are shown here. This page cannot confirm the file was saved.');
     } catch (caught) {
       setTransferMode('idle');
       fail('download', caught);
@@ -348,6 +493,10 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
 
   return (
     <>
+    <TransferCards items={cards} onCancel={(id) => {
+      if (id.startsWith('direct-')) cancelDirect();
+      downloadCancels.current.get(id)?.();
+    }} onRetry={() => undefined} />
     {hidden ? <section className="panel" aria-label="Connection">{status}</section> : null}
     <section className="panel share-desk" hidden={hidden}>
       <h2>Share files and folders</h2>
@@ -485,7 +634,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
                 <a className="button" href={relayZipUrl(listing.share.id, dir)} onClick={(event) => void startRelay(event)}>Download this folder</a>
               )}
               {picked.length > 0 ? <a className="button" href={relayZipUrl(listing.share.id, '', picked)} onClick={(event) => void startRelay(event)}>Download selected</a> : null}
-              <p className="meta">Progress appears in your browser’s download list. Cancel it there to stop. A folder is sent as a zip and is not kept on this computer.</p>
+              <p className="meta">A folder is sent as a zip and is not kept on this computer. This page shows bytes sent, not a saved file.</p>
             </div>
           ) : null}
           <ul className="share-tree">

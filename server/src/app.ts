@@ -250,7 +250,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   registerShareRoutes(app, shareHub, requireAuth, requireCsrf, ensurePeerId, transfers);
 
   app.get('/api/transfers/:id', requireAuth, (req, res) => {
-    const viewed = transfers.view(req.session.userId!, routeId(req));
+    const viewed = transfers.view(req.sessionID, routeId(req));
     if (!viewed) {
       res.status(404).json({ error: 'That transfer is not available.' });
       return;
@@ -259,7 +259,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   });
 
   app.delete('/api/transfers/:id', requireAuth, requireCsrf, (req, res) => {
-    if (!transfers.cancel(req.session.userId!, routeId(req))) {
+    if (!transfers.cancel(req.sessionID, routeId(req))) {
       res.status(404).json({ error: 'That transfer is not available.' });
       return;
     }
@@ -1768,11 +1768,10 @@ function attachDownload(
   input: { filename: string; kind: 'library' | 'library-zip'; totalBytes: number | null; sourceTotal: number | null },
 ): string | null {
   const id = readProgressId(req.query.progress);
-  const userId = req.session.userId;
-  if (!id || !userId) return null;
+  if (!id || !req.sessionID) return null;
   const opened = transfers.open({
     id,
-    userId,
+    sessionId: req.sessionID,
     filename: safeTransferName(input.filename),
     kind: input.kind,
     totalBytes: input.totalBytes,
@@ -1843,7 +1842,7 @@ async function handleDeleteMany(req: Request, res: Response, db: DatabaseSync, c
   res.json(result);
 }
 
-async function handleZip(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+async function handleZip(req: Request, res: Response, db: DatabaseSync, config: AppConfig, transfers: TransferTracker): Promise<void> {
   const raw = typeof req.query.ids === 'string' ? req.query.ids.split(',') : [];
   const ids = readIds(raw);
   if (!ids) {
@@ -1862,15 +1861,36 @@ async function handleZip(req: Request, res: Response, db: DatabaseSync, config: 
     }
     entries.push({ name: uniqueZipName(used, record.originalName), filePath: finalPath, size });
   }
+  const sourceTotal = entries.reduce((sum, entry) => sum + entry.size, 0);
+  const progressId = attachDownload(req, res, transfers, {
+    filename: 'portal-files.zip',
+    kind: 'library-zip',
+    totalBytes: null,
+    sourceTotal,
+  });
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', attachmentDisposition('portal-files.zip'));
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, no-store');
+  let settled = false;
+  req.on('close', () => {
+    if (!res.writableEnded && !settled) transfers.fail(progressId, 'closed');
+  });
   try {
-    await writeStoredZip(res, entries);
+    let lastHttp = 0;
+    let lastSource = 0;
+    await writeStoredZip(res, entries, ({ httpBytes, sourceBytes }) => {
+      transfers.add(progressId, 'sentBytes', httpBytes - lastHttp);
+      transfers.add(progressId, 'sourceBytes', sourceBytes - lastSource);
+      lastHttp = httpBytes;
+      lastSource = sourceBytes;
+    });
     res.end();
+    settled = true;
+    transfers.finish(progressId);
   } catch (error) {
     console.error(`zip failed (${error instanceof Error && 'code' in error ? String(error.code) : 'unknown'})`);
+    if (!settled) transfers.fail(progressId, 'failed');
     if (!res.headersSent) {
       res.status(500).json({ error: 'The files could not be packed.' });
     } else {

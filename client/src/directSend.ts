@@ -1,4 +1,5 @@
 import { postSignal, type DirectSignal } from './api';
+import { receiveDirectFile, sendDirectFile, type DirectSendProgress } from './directChannel';
 import { localFile } from './localFiles';
 
 const DIRECT_MAX_BYTES = 256 * 1024 * 1024;
@@ -12,7 +13,9 @@ type Link = {
   fail: (message: string) => void;
 };
 
-export function createDirectHub() {
+export function createDirectHub(hooks: {
+  onSend?: (event: { id: string; filename: string; progress: DirectSendProgress; status: 'sending' | 'finishing' | 'completed' | 'lost' }) => void;
+} = {}) {
   const links = new Map<string, Link>();
 
   async function handle(signal: DirectSignal, csrf: string): Promise<void> {
@@ -58,7 +61,12 @@ export function createDirectHub() {
     }
   }
 
-  function requestFile(fileId: string, ownerId: string, csrf: string): Promise<Blob> {
+  function requestFile(
+    fileId: string,
+    ownerId: string,
+    csrf: string,
+    options: { onProgress?: (received: number, total: number) => void; signal?: AbortSignal } = {},
+  ): Promise<Blob> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let transferId = '';
@@ -85,7 +93,7 @@ export function createDirectHub() {
       pc.ondatachannel = (event) => {
         const channel = event.channel;
         channel.binaryType = 'arraybuffer';
-        receiveFile(channel).then((blob) => finish(undefined, blob)).catch((caught: unknown) => {
+        receiveDirectFile(channel, options).then((blob) => finish(undefined, blob)).catch((caught: unknown) => {
           finish(caught instanceof Error ? caught : new Error('The direct transfer stopped. Use Download.'));
         });
       };
@@ -147,7 +155,35 @@ export function createDirectHub() {
       }, csrf);
     };
     channel.onopen = () => {
-      void sendFile(channel, file).catch(() => closeLink(signal.transferId));
+      hooks.onSend?.({
+        id: signal.transferId,
+        filename: file.name,
+        progress: { sentBytes: 0, confirmedBytes: 0, totalBytes: file.size },
+        status: 'sending',
+      });
+      void sendDirectFile(channel, file, CHUNK_BYTES, {
+        onProgress: (progress) => hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress,
+          status: progress.confirmedBytes >= file.size ? 'finishing' : 'sending',
+        }),
+      }).then(() => {
+        hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress: { sentBytes: file.size, confirmedBytes: file.size, totalBytes: file.size },
+          status: 'completed',
+        });
+      }).catch(() => {
+        hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress: { sentBytes: 0, confirmedBytes: 0, totalBytes: file.size },
+          status: 'lost',
+        });
+        closeLink(signal.transferId);
+      });
     };
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -188,45 +224,3 @@ function rejectMessage(payload: string): string {
   return 'The uploader does not have this file in the open browser. Use Download.';
 }
 
-async function sendFile(channel: RTCDataChannel, file: File): Promise<void> {
-  channel.send(JSON.stringify({ type: 'meta', name: file.name, size: file.size }));
-  let offset = 0;
-  while (offset < file.size) {
-    if (channel.bufferedAmount > 1024 * 1024) {
-      await new Promise<void>((resolve) => {
-        channel.addEventListener('bufferedamountlow', () => resolve(), { once: true });
-      });
-    }
-    const end = Math.min(offset + CHUNK_BYTES, file.size);
-    channel.send(await file.slice(offset, end).arrayBuffer());
-    offset = end;
-  }
-  channel.send(JSON.stringify({ type: 'done' }));
-}
-
-function receiveFile(channel: RTCDataChannel): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    const parts: BlobPart[] = [];
-    let expected = -1;
-    let received = 0;
-    channel.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        const message = JSON.parse(event.data) as { type?: string; size?: number };
-        if (message.type === 'meta' && typeof message.size === 'number') expected = message.size;
-        if (message.type === 'done') {
-          if (expected >= 0 && received === expected) resolve(new Blob(parts));
-          else reject(new Error('The direct transfer stopped early. Use Download.'));
-        }
-        return;
-      }
-      const chunk = event.data as ArrayBuffer;
-      parts.push(chunk);
-      received += chunk.byteLength;
-    };
-    channel.onclose = () => {
-      if (expected < 0 || received !== expected) {
-        reject(new Error('The direct transfer stopped. Use Download.'));
-      }
-    };
-  });
-}

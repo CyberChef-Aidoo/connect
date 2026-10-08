@@ -28,6 +28,7 @@ export type FileActionProps = {
   canDirect: (file: PortalFile) => boolean;
   takingId: string | null;
   onDirect: (file: PortalFile) => void;
+  onDownload: (href: string, filename: string) => void;
 };
 
 type FileListProps = Omit<FileActionProps, 'file'> & {
@@ -591,7 +592,16 @@ function FavoriteButton({ file, csrfToken, onChanged, onError }: FileActionProps
 function FileActions(props: FileActionProps) {
   return (
     <div className="file-actions">
-      <a className="button file-download" href={`/api/files/${encodeURIComponent(props.file.id)}/download`}>Download</a>
+      <a
+        className="button file-download"
+        href={`/api/files/${encodeURIComponent(props.file.id)}/download`}
+        onClick={(event) => {
+          event.preventDefault();
+          props.onDownload(`/api/files/${encodeURIComponent(props.file.id)}/download`, props.file.originalName);
+        }}
+      >
+        Download
+      </a>
       <FileMenu {...props} />
     </div>
   );
@@ -838,6 +848,7 @@ function VersionDialog({
   onClose,
   onChanged,
   onError,
+  onDownload,
 }: FileActionProps & { open: boolean; onClose: () => void }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [versions, setVersions] = useState<FileVersion[]>([]);
@@ -885,7 +896,15 @@ function VersionDialog({
             <li key={version.id}>
               <span className="filename">{version.originalName}</span>
               <span className="meta">{formatBytes(version.sizeBytes)} · {formatWhen(version.createdAt)}</span>
-              <a href={`/api/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(version.id)}/download`}>Download</a>
+              <a
+                href={`/api/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(version.id)}/download`}
+                onClick={(event) => {
+                  event.preventDefault();
+                  onDownload(`/api/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(version.id)}/download`, version.originalName);
+                }}
+              >
+                Download
+              </a>
               {file.canDelete ? (
                 <button type="button" className="ghost danger" disabled={busy} onClick={() => void removeVersion(version.id)}>Remove</button>
               ) : null}

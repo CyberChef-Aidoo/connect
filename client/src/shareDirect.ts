@@ -1,3 +1,4 @@
+import { receiveDirectFile, sendDirectFile, type DirectSendProgress } from './directChannel';
 import { postShareSignal, type ShareSignal } from './shareClient';
 
 const DIRECT_MAX_BYTES = 32 * 1024 * 1024;
@@ -15,7 +16,10 @@ export function directShareAvailable(size: number): boolean {
   return secure && typeof RTCPeerConnection !== 'undefined' && size > 0 && size <= DIRECT_MAX_BYTES;
 }
 
-export function createShareDirect(lookup: (fileId: string) => File | undefined) {
+export function createShareDirect(
+  lookup: (fileId: string) => File | undefined,
+  hooks: { onSend?: (event: { id: string; filename: string; progress: DirectSendProgress; status: 'sending' | 'finishing' | 'completed' | 'lost' }) => void } = {},
+) {
   const links = new Map<string, Link>();
 
   async function handle(signal: ShareSignal, csrf: string): Promise<void> {
@@ -83,7 +87,35 @@ export function createShareDirect(lookup: (fileId: string) => File | undefined) 
       }, csrf);
     };
     channel.onopen = () => {
-      void sendFile(channel, file).catch(() => close(signal.transferId));
+      hooks.onSend?.({
+        id: signal.transferId,
+        filename: file.name,
+        progress: { sentBytes: 0, confirmedBytes: 0, totalBytes: file.size },
+        status: 'sending',
+      });
+      void sendDirectFile(channel, file, CHUNK_BYTES, {
+        onProgress: (progress) => hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress,
+          status: progress.confirmedBytes >= file.size ? 'finishing' : 'sending',
+        }),
+      }).then(() => {
+        hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress: { sentBytes: file.size, confirmedBytes: file.size, totalBytes: file.size },
+          status: 'completed',
+        });
+      }).catch(() => {
+        hooks.onSend?.({
+          id: signal.transferId,
+          filename: file.name,
+          progress: { sentBytes: 0, confirmedBytes: 0, totalBytes: file.size },
+          status: 'lost',
+        });
+        close(signal.transferId);
+      });
     };
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -131,24 +163,9 @@ export function createShareDirect(lookup: (fileId: string) => File | undefined) 
       pc.ondatachannel = (event) => {
         const channel = event.channel;
         channel.binaryType = 'arraybuffer';
-        const parts: BlobPart[] = [];
-        let expected = -1;
-        let received = 0;
-        channel.onmessage = (message) => {
-          if (typeof message.data === 'string') {
-            const parsed = JSON.parse(message.data) as { type?: string; size?: number };
-            if (parsed.type === 'meta' && typeof parsed.size === 'number') expected = parsed.size;
-            if (parsed.type === 'done') {
-              if (expected >= 0 && received === expected) finish(undefined, new Blob(parts));
-              else finish(new Error('The direct download stopped early.'));
-            }
-            return;
-          }
-          const chunk = message.data as ArrayBuffer;
-          parts.push(chunk);
-          received += chunk.byteLength;
-          if (expected > 0) options.onProgress?.(received, expected);
-        };
+        receiveDirectFile(channel, options).then((blob) => finish(undefined, blob)).catch((caught: unknown) => {
+          finish(caught instanceof Error ? caught : new Error('The direct download stopped early.'));
+        });
       };
       void postShareSignal({ shareId, fileId, toPeerId: ownerPeerId, kind: 'request', payload: '' }, csrf).then((result) => {
         transferId = result.transferId;
@@ -176,20 +193,4 @@ export function createShareDirect(lookup: (fileId: string) => File | undefined) 
   }
 
   return { handle, receive, closeAll() { for (const id of [...links.keys()]) close(id); } };
-}
-
-async function sendFile(channel: RTCDataChannel, file: File): Promise<void> {
-  channel.send(JSON.stringify({ type: 'meta', size: file.size }));
-  let offset = 0;
-  while (offset < file.size) {
-    if (channel.readyState !== 'open') throw new Error('The direct connection closed.');
-    while (channel.bufferedAmount > 1024 * 1024) {
-      await new Promise((resolve) => window.setTimeout(resolve, 20));
-      if (channel.readyState !== 'open') throw new Error('The direct connection closed.');
-    }
-    const end = Math.min(offset + CHUNK_BYTES, file.size);
-    channel.send(await file.slice(offset, end).arrayBuffer());
-    offset = end;
-  }
-  channel.send(JSON.stringify({ type: 'done' }));
 }

@@ -21,7 +21,7 @@ export type TransferView = {
 };
 
 type Row = TransferView & {
-  userId: string;
+  sessionId: string;
   abort: (() => void) | null;
   updatedAt: number;
 };
@@ -46,7 +46,7 @@ export function createTransferTracker() {
 
   function open(input: {
     id: string;
-    userId: string;
+    sessionId: string;
     filename: string;
     kind: TransferKind;
     totalBytes: number | null;
@@ -55,7 +55,7 @@ export function createTransferTracker() {
   }): boolean {
     if (!ID_RE.test(input.id) || rows.has(input.id)) return false;
     rows.set(input.id, {
-      userId: input.userId,
+      sessionId: input.sessionId,
       filename: safeTransferName(input.filename),
       kind: input.kind,
       totalBytes: input.totalBytes,
@@ -99,10 +99,10 @@ export function createTransferTracker() {
     row.updatedAt = Date.now();
   }
 
-  function view(userId: string, id: string): TransferView | null {
+  function view(sessionId: string, id: string): TransferView | null {
     sweep();
     const row = rows.get(id);
-    if (!row || row.userId !== userId) return null;
+    if (!row || row.sessionId !== sessionId) return null;
     return {
       filename: row.filename,
       kind: row.kind,
@@ -117,9 +117,9 @@ export function createTransferTracker() {
     };
   }
 
-  function cancel(userId: string, id: string): boolean {
+  function cancel(sessionId: string, id: string): boolean {
     const row = rows.get(id);
-    if (!row || row.userId !== userId) return false;
+    if (!row || row.sessionId !== sessionId) return false;
     const abort = row.abort;
     fail(id, 'stopped');
     abort?.();

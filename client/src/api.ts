@@ -336,6 +336,13 @@ export async function deleteFile(id: string, csrfToken: string): Promise<void> {
 
 const DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
 
+export type UploadTick = {
+  sentBytes: number;
+  confirmedBytes: number;
+  totalBytes: number;
+  phase: 'sending' | 'finishing';
+};
+
 export async function listTags(): Promise<{ tags: TagItem[] }> {
   const response = await fetch('/api/tags', { credentials: 'same-origin' });
   return readJson(response);
@@ -440,7 +447,7 @@ export async function deleteUpload(id: string, csrfToken: string): Promise<void>
 export async function uploadFile(
   file: File,
   csrfToken: string,
-  onProgress: (loaded: number, total: number) => void,
+  onProgress: (tick: UploadTick) => void,
   signal: AbortSignal,
   start: UploadStart = {},
 ): Promise<PortalFile> {
@@ -456,7 +463,7 @@ export async function uploadFile(
       signal,
     );
     if (created.file) {
-      onProgress(file.size, file.size);
+      onProgress({ sentBytes: file.size, confirmedBytes: file.size, totalBytes: file.size, phase: 'finishing' });
       return created.file;
     }
     if (!created.session) throw new ApiError(500, 'The server did not confirm the upload.');
@@ -475,10 +482,18 @@ export async function uploadFile(
       blob: file.slice(offset, end),
       csrfToken,
       signal,
-      onProgress: (loaded) => onProgress(Math.min(file.size, offset + loaded), file.size),
+      onProgress: (loaded) => {
+        const sentBytes = Math.min(file.size, offset + loaded);
+        onProgress({
+          sentBytes,
+          confirmedBytes: offset,
+          totalBytes: file.size,
+          phase: sentBytes >= file.size ? 'finishing' : 'sending',
+        });
+      },
     });
     if (outcome.kind === 'file') {
-      onProgress(file.size, file.size);
+      onProgress({ sentBytes: file.size, confirmedBytes: file.size, totalBytes: file.size, phase: 'finishing' });
       return outcome.file;
     }
     if (outcome.receivedBytes === offset) {

@@ -1,6 +1,19 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { formatRemaining, formatSpeed, rememberSample, transferView } from './transfer.ts';
+import { readAck } from './directChannel.ts';
+import { applyServerProgress, type DownloadWatch } from './browserDownload.ts';
+import {
+  directReadyToFinish,
+  displayPercent,
+  explainTransferFailure,
+  formatRemaining,
+  formatSpeed,
+  overallBytes,
+  rememberSample,
+  shouldPaint,
+  transferStatusLabel,
+  transferView,
+} from './transfer.ts';
 
 describe('transfer estimates', () => {
   it('waits for two samples before showing a speed', () => {
@@ -79,5 +92,81 @@ describe('transfer estimates', () => {
 
   it('formats longer estimates in minutes', () => {
     assert.equal(formatRemaining(120_000, false), 'About 2 min left');
+  });
+
+  it('measures overall progress by bytes and stays indeterminate when one size is unknown', () => {
+    const known = overallBytes([
+      { transferredBytes: 0, totalBytes: 10 },
+      { transferredBytes: 90, totalBytes: 100 },
+    ]);
+    assert.equal(known.transferredBytes, 90);
+    assert.equal(known.totalBytes, 110);
+    assert.equal(known.percent, 82);
+    const average = Math.round(((0 / 10) * 100 + (90 / 100) * 100) / 2);
+    assert.notEqual(known.percent, average);
+    const unknown = overallBytes([
+      { transferredBytes: 20, totalBytes: 40 },
+      { transferredBytes: 5, totalBytes: null },
+    ]);
+    assert.equal(unknown.totalBytes, null);
+    assert.equal(unknown.percent, null);
+  });
+
+  it('does not show a finished upload until completion is allowed', () => {
+    assert.equal(displayPercent(100, 100, false), 99);
+    assert.equal(displayPercent(100, 100, true), 100);
+    assert.equal(displayPercent(10, null, false), null);
+    assert.equal(directReadyToFinish(4, 5), false);
+    assert.equal(directReadyToFinish(5, 5), true);
+    assert.equal(transferStatusLabel('finishing'), 'Finishing up');
+    assert.equal(transferStatusLabel('lost'), 'Connection lost');
+  });
+
+  it('paints at most about four times a second unless the status changes', () => {
+    assert.equal(shouldPaint(1_000, 1_100, false), false);
+    assert.equal(shouldPaint(1_000, 1_250, false), true);
+    assert.equal(shouldPaint(1_000, 1_100, true), true);
+  });
+
+  it('hides unexpected failure text and keeps a direct acknowledgement', () => {
+    const hidden = explainTransferFailure(500, 'password=hunter2 csrf=token');
+    assert.equal(hidden.message.includes('hunter2'), false);
+    assert.equal(hidden.status, 'retry');
+    const lost = explainTransferFailure(0, 'Failed to fetch');
+    assert.equal(lost.status, 'lost');
+    assert.equal(readAck(JSON.stringify({ type: 'ack', received: 32 })), 32);
+    assert.equal(readAck('not-json'), null);
+  });
+
+  it('keeps sent bytes separate from a saved file for a browser download', () => {
+    const current: DownloadWatch = {
+      id: '1',
+      href: '/api/files/a/download',
+      filename: 'notes.txt',
+      kind: 'library',
+      totalBytes: null,
+      sentBytes: 0,
+      uploadBytes: 0,
+      sourceBytes: 0,
+      sourceTotal: null,
+      status: 'downloading',
+      error: null,
+    };
+    const next = applyServerProgress(current, {
+      kind: 'library',
+      totalBytes: 20,
+      sentBytes: 20,
+      savedBytes: null,
+      done: true,
+      error: null,
+    });
+    assert.equal(next.sentBytes, 20);
+    assert.equal(next.status, 'completed');
+    const zip = applyServerProgress(current, { kind: 'library-zip', totalBytes: null, sentBytes: 8, sourceBytes: 5, sourceTotal: 10, done: false });
+    assert.equal(zip.totalBytes, null);
+    assert.equal(zip.status, 'downloading');
+    const relay = applyServerProgress(current, { kind: 'relay', totalBytes: 20, sentBytes: 0, uploadBytes: 12, done: false });
+    assert.equal(relay.status, 'sending');
+    assert.equal(relay.uploadBytes, 12);
   });
 });
