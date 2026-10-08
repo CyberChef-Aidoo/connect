@@ -203,6 +203,14 @@ try {
   }))()`);
 
   await size(send, 390, 844);
+  const sheet = await evaluate(send, `(() => new Promise(async (resolve) => {
+    const filters = [...document.querySelectorAll('button')].find((item) => item.textContent.startsWith('Filters'));
+    filters.focus();
+    filters.click();
+    await new Promise((r) => setTimeout(r, 200));
+    const dialog = document.querySelector('dialog.library-sheet');
+    resolve({ open: Boolean(dialog?.open), title: dialog?.querySelector('h3')?.textContent || '' });
+  }))()`);
   const phone = await evaluate(send, `(() => {
     const search = document.querySelector('.library-search');
     const tools = document.querySelector('.library-tools');
@@ -218,10 +226,10 @@ try {
     };
   })()`);
 
-  console.log(JSON.stringify({ boxes, behavior, phone }, null, 2));
+  console.log(JSON.stringify({ boxes, behavior, phone, sheet }, null, 2));
   ws.close();
   const overflow = boxes.filter((box) => box.scroll > box.client + 1 || box.searchClipped || box.wide.length > 0);
-  if (overflow.length > 0 || !behavior.dialogOpen || !behavior.focusAfterDialog || !behavior.empty || phone.scroll > phone.client + 1) {
+  if (overflow.length > 0 || !behavior.dialogOpen || !behavior.focusAfterDialog || !behavior.empty || phone.scroll > phone.client + 1 || !sheet.open) {
     process.exitCode = 1;
   }
 } catch (error) {
