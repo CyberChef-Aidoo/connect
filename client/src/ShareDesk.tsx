@@ -340,7 +340,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   const status = (
     <div className="connection-plain">
       <p><strong>{plain.title}</strong></p>
-      <p>{plain.detail}</p>
+      <p>{link === 'reachable' && connectionProblem ? connectionProblem : plain.detail}</p>
       <p>{browsersHere(people.map((person) => person.displayName))}</p>
       <button type="button" className="ghost" onClick={() => { setCopyNote(''); setHelpOpen(true); }}>Help</button>
     </div>
@@ -507,7 +507,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
                 </label>
                 <span className="meta">{formatBytes(file.size)}</span>
                 {listing.share.available && !listing.share.mine && directShareAvailable(file.size) ? (
-                  <button type="button" onClick={() => void takeDirect(listing.share, file)}>From their browser</button>
+                  <button type="button" onClick={() => void takeDirect(listing.share, file)}>Download from their browser</button>
                 ) : null}
                 {listing.share.available ? (
                   <a href={relayFileUrl(listing.share.id, file.id)} onClick={(event) => void startRelay(event)}>Download</a>
@@ -518,6 +518,33 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
         </div>
       ) : null}
     </section>
+    <dialog
+      ref={helpRef}
+      className="library-dialog"
+      aria-labelledby="connection-help-title"
+      onClose={() => setHelpOpen(false)}
+    >
+      <h2 id="connection-help-title">Connection details</h2>
+      <p>This page checks for other browsers about every couple of seconds. A successful check does not mean a file is being shared. These details do not include passwords or file contents.</p>
+      <dl className="connection-status">
+        <div><dt>Build</dt><dd>{__PORTAL_BUILD__}</dd></div>
+        <div><dt>Last successful check</dt><dd>{polledAt ? new Date(polledAt).toLocaleString() : 'None'}</dd></div>
+        <div><dt>This browser</dt><dd>{selfId ? 'Checked in' : 'Not checked in'}</dd></div>
+        <div><dt>Other browsers</dt><dd>{people.length === 0 ? 'None' : people.map((person) => person.displayName).join(', ')}</dd></div>
+        <div><dt>Shares with files still open</dt><dd>{sharesReady}. This counts shares, not files or computers.</dd></div>
+        <div><dt>Browser-to-browser download</dt><dd>{directAvailable ? 'Available for a single file up to 32 MB when you choose it.' : 'Not available on this address. A secure address (https) is required. Use Download.'}</dd></div>
+        <div><dt>Transfer</dt><dd>{transferLabel(transferMode)}</dd></div>
+      </dl>
+      <label>
+        Details for support
+        <textarea ref={detailsRef} readOnly value={details} rows={8} />
+      </label>
+      <div className="actions">
+        <button type="button" onClick={copyDetails}>Copy details for support</button>
+        <button type="button" className="ghost" onClick={() => helpRef.current?.close()}>Close</button>
+      </div>
+      {copyNote ? <p className="meta" role="status">{copyNote}</p> : null}
+    </dialog>
     </>
   );
 }
