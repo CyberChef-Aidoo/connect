@@ -38,6 +38,7 @@ type Job = {
   cursor: number;
   cancelled: boolean;
   createdAt: number;
+  progressId: string | null;
   waiter: ((stream: PassThrough) => void) | null;
   rejecter: ((error: Error) => void) | null;
 };
@@ -314,9 +315,19 @@ export function createShareHub(maxFileBytes: number) {
       cursor: 0,
       cancelled: false,
       createdAt: now,
+      progressId: null,
       waiter: null,
       rejecter: null,
     };
+  }
+
+  function attachProgress(jobId: string, progressId: string): void {
+    const job = jobs.get(jobId);
+    if (job && !job.cancelled) job.progressId = progressId;
+  }
+
+  function progressFor(jobId: string): string | null {
+    return jobs.get(jobId)?.progressId ?? null;
   }
 
   function cancelJob(job: Job, message: string): void {
@@ -424,6 +435,8 @@ export function createShareHub(maxFileBytes: number) {
     takeBytes,
     waitForFile,
     cancelDownload,
+    attachProgress,
+    progressFor,
     abortJob,
     finish,
     postSignal,

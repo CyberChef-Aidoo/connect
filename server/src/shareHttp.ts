@@ -4,6 +4,8 @@ import type { Express } from 'express';
 import { once } from 'node:events';
 import { attachmentDisposition } from './storage.js';
 import type { ShareHub } from './shares.js';
+import type { TransferTracker } from './transferTrack.js';
+import { readProgressId, safeTransferName, writeChunks } from './transferTrack.js';
 import { writeZipFromSources } from './zip.js';
 
 type Guard = (req: Request, res: Response, next: NextFunction) => void;
@@ -14,6 +16,7 @@ export function registerShareRoutes(
   requireAuth: Guard,
   requireCsrf: Guard,
   peerIdFor: (req: Request) => Promise<string>,
+  tracker: TransferTracker,
 ): void {
   app.get('/api/share-peers', requireAuth, async (req, res, next) => {
     try {
@@ -101,10 +104,12 @@ export function registerShareRoutes(
         return;
       }
       let seen = 0;
+      const progressId = hub.progressFor(routeParam(req, 'jobId'));
       for await (const piece of req) {
         const chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
         seen += chunk.length;
         if (seen > taken.size) break;
+        tracker.add(progressId, 'uploadBytes', chunk.length);
         if (!taken.stream.write(chunk)) await once(taken.stream, 'drain');
       }
       if (seen !== taken.size) {
@@ -195,9 +200,16 @@ export function registerShareRoutes(
       }
       shareLog('download relay', { request: requestId, transfer: started.job.id, share: routeParam(req, 'id'), file: routeParam(req, 'fileId') });
       const downloadName = started.file.relativePath.split('/').pop() ?? 'download';
+      const progressId = openDownloadTrack(req, res, tracker, {
+        filename: downloadName,
+        kind: 'relay',
+        totalBytes: started.file.size,
+        sourceTotal: started.file.size,
+      });
+      if (progressId) hub.attachProgress(started.job.id, progressId);
       await pumpDownload(req, res, started.file.size, downloadName, () => hub.waitForFile(started.job, started.file.id), () => {
         hub.cancelDownload(started.job.id);
-      });
+      }, (bytes) => tracker.add(progressId, 'sentBytes', bytes), progressId, tracker);
       hub.finish(started.job.id);
     } catch (error) {
       next(error);
@@ -228,13 +240,24 @@ export function registerShareRoutes(
       }
       shareLog('archive relay', { request: requestId, transfer: started.job.id, share: routeParam(req, 'id'), files: started.files.length });
       const folder = typeof req.query.dir === 'string' ? req.query.dir : '';
+      const sourceTotal = started.files.reduce((sum, file) => sum + file.size, 0);
+      const progressId = openDownloadTrack(req, res, tracker, {
+        filename: 'shared-folder.zip',
+        kind: 'relay-zip',
+        totalBytes: null,
+        sourceTotal,
+      });
+      if (progressId) hub.attachProgress(started.job.id, progressId);
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', attachmentDisposition('shared-folder.zip'));
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'private, no-store');
       res.setHeader('X-Transfer-Mode', 'relay');
       req.on('close', () => {
-        if (!res.writableEnded) hub.cancelDownload(started.job.id);
+        if (!res.writableEnded) {
+          hub.cancelDownload(started.job.id);
+          tracker.fail(progressId, 'closed');
+        }
       });
       try {
         await writeZipFromSources(res, started.files.map((file) => ({
@@ -244,10 +267,17 @@ export function registerShareRoutes(
             const stream = await hub.waitForFile(started.job, file.id);
             for await (const chunk of stream) yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           },
-        })));
+        })), ({ httpBytes, sourceBytes }) => {
+          tracker.add(progressId, 'sentBytes', httpBytes - lastHttp);
+          tracker.add(progressId, 'sourceBytes', sourceBytes - lastSource);
+          lastHttp = httpBytes;
+          lastSource = sourceBytes;
+        });
         res.end();
+        tracker.finish(progressId);
       } catch (error) {
         hub.cancelDownload(started.job.id);
+        tracker.fail(progressId, 'failed');
         if (!res.headersSent) next(error);
         else res.destroy();
       } finally {
