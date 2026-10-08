@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test src/transfer.test.ts src/resumeMatch.test.ts src/folderUpload.test.ts src/randomId.test.ts"
+    "test": "node --import tsx --test src/transfer.test.ts src/resumeMatch.test.ts src/folderUpload.test.ts src/randomId.test.ts src/shareCopy.test.ts"
   },
   "dependencies": {
     "react": "^19.1.1",

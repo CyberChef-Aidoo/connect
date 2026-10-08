@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ApiError } from './api';
 import { randomId } from './randomId';
+import { browsersHere, connectionPlain, explainRejected, explainShareError, supportDetails, transferLabel } from './shareCopy';
 import { formatBytes } from './format';
 import { createShareDirect, directShareAvailable } from './shareDirect';
 import {
@@ -51,12 +51,17 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   const [picked, setPicked] = useState<string[]>([]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [connectionProblem, setConnectionProblem] = useState('');
+  const [lastStatus, setLastStatus] = useState<number | null>(null);
   const [busy, setBusy] = useState('');
   const [selfId, setSelfId] = useState('');
-  const [apiState, setApiState] = useState('Checking…');
-  const [signalState, setSignalState] = useState('Connecting…');
-  const [transferMode, setTransferMode] = useState('Idle');
+  const [link, setLink] = useState<'checking' | 'reachable' | 'unreachable' | 'signed-out'>('checking');
+  const [transferMode, setTransferMode] = useState<'idle' | 'download' | 'direct'>('idle');
   const [polledAt, setPolledAt] = useState<number | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [copyNote, setCopyNote] = useState('');
+  const helpRef = useRef<HTMLDialogElement>(null);
+  const detailsRef = useRef<HTMLTextAreaElement>(null);
   const reported = useRef('');
   const missingJobs = useRef(new Set<string>());
 
@@ -76,8 +81,8 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
             takeShareSignals(),
           ]);
           if (stop) return;
-          setApiState('Reachable');
-          setSignalState('HTTP connected');
+          setLink('reachable');
+          setConnectionProblem('');
           setPolledAt(Date.now());
           setSelfId(peerList.self);
           setPeople(peerList.people);
@@ -121,16 +126,11 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
           }
         } catch (caught) {
           if (stop) return;
-          const reason = caught instanceof Error ? caught.message : 'The portal could not be reached.';
-          if (caught instanceof TypeError) {
-            setApiState('Unreachable');
-            setSignalState('Not connected');
-          } else {
-            setApiState('Reachable');
-            setSignalState(caught instanceof ApiError && caught.status === 401 ? 'Session was not sent' : 'Not connected');
-          }
-          setError(reason);
-          console.info('portal connection', { api: caught instanceof TypeError ? 'unreachable' : 'error', detail: reason });
+          const signedOut = caught instanceof Error && 'status' in caught && (caught as { status?: number }).status === 401;
+          setLink(caught instanceof TypeError ? 'unreachable' : signedOut ? 'signed-out' : 'reachable');
+          setConnectionProblem(explainShareError('check', caught));
+          setLastStatus(caught instanceof Error && 'status' in caught ? Number((caught as { status?: number }).status) || null : null);
+          console.info('portal connection', { api: caught instanceof TypeError ? 'unreachable' : 'error', status: signedOut ? 401 : 0 });
         } finally {
           polling = false;
         }
@@ -154,7 +154,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     void browseShare(openId, dir, query).then((next) => {
       if (!stop) setListing(next);
     }).catch((caught: unknown) => {
-      if (!stop) setError(caught instanceof Error ? caught.message : 'That share could not be opened.');
+      if (!stop) fail('open', caught);
     });
     return () => { stop = true; };
   }, [openId, dir, query, shares]);
@@ -162,6 +162,18 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   useEffect(() => {
     setPicked([]);
   }, [openId, dir]);
+
+  useEffect(() => {
+    const dialog = helpRef.current;
+    if (!dialog) return;
+    if (helpOpen && !dialog.open) dialog.showModal();
+    if (!helpOpen && dialog.open) dialog.close();
+  }, [helpOpen]);
+
+  function fail(action: 'open' | 'preview' | 'publish' | 'stop' | 'download' | 'direct', caught: unknown) {
+    setError(explainShareError(action, caught));
+    setLastStatus(caught instanceof Error && 'status' in caught ? Number((caught as { status?: number }).status) || null : null);
+  }
 
   function rememberName(value: string) {
     setNameOnNetwork(value);
@@ -192,13 +204,13 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       setChosenPeers([]);
       setMessage('');
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Those files could not be previewed.');
+      fail('preview', caught);
     }
   }
 
   async function confirmShare() {
     if (!preview || !drafts) return;
-    setBusy('Publishing…');
+    setBusy('Starting share…');
     setError('');
     try {
       const published = await publishShare(shareName, chosenPeers, preview, csrf);
@@ -208,23 +220,23 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       }
       setDrafts(null);
       setPreview(null);
-      setMessage(`“${published.share.name}” is visible to the people you chose. Keep this tab open. Reloading asks you to select the files again.`);
+      setMessage(`“${published.share.name}” is shared with the people you chose. Keep this tab open. If you reload, choose the files again.`);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'The share could not be published.');
+      fail('publish', caught);
     } finally {
       setBusy('');
     }
   }
 
   async function revoke(share: ShareSummary) {
-    const agreed = window.confirm('Stop new downloads of this share? People who already received a file keep that copy. It cannot be recalled.');
+    const agreed = window.confirm('Stop sharing these files? People who already downloaded a copy keep that copy. You cannot take it back. New downloads will be refused.');
     if (!agreed) return;
     try {
-      const note = await revokeShare(share.id, csrf);
+      await revokeShare(share.id, csrf);
       if (openId === share.id) setOpenId(null);
-      setMessage(note);
+      setMessage('Sharing has stopped. Copies already downloaded stay with the people who received them.');
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'The share could not be revoked.');
+      fail('stop', caught);
     }
   }
 
@@ -238,7 +250,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
     directAbort.current = controller;
     const label = file.relativePath.split('/').pop() ?? 'download';
     setBusy(`Receiving ${label}…`);
-    setTransferMode('Direct');
+    setTransferMode('direct');
     setError('');
     console.info('portal transfer', { share: share.id, file: file.id, mode: 'direct' });
     try {
@@ -252,11 +264,11 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       link.download = file.relativePath.split('/').pop() ?? 'download';
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setMessage(`Received ${link.download} directly from their browser.`);
-      setTransferMode('Idle');
+      setMessage(`Received ${link.download} from their browser.`);
+      setTransferMode('idle');
     } catch (caught) {
-      setTransferMode('Relay');
-      setError(caught instanceof Error ? caught.message : 'Direct download is not available. Use Download through this computer.');
+      setTransferMode('idle');
+      fail('direct', caught);
       console.info('portal transfer', { share: share.id, file: file.id, mode: 'direct', result: 'failed' });
     } finally {
       setBusy('');
@@ -266,65 +278,95 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
   async function startRelay(event: { preventDefault: () => void; currentTarget: HTMLAnchorElement }) {
     event.preventDefault();
     const href = event.currentTarget.href;
-    setTransferMode('Relay');
+    setTransferMode('download');
     setError('');
     try {
       await confirmRelay(href);
-      console.info('portal transfer', { mode: 'relay', url: new URL(href).pathname });
+      console.info('portal transfer', { mode: 'download', url: new URL(href).pathname });
       const link = document.createElement('a');
       link.href = href;
       link.rel = 'noopener';
       document.body.appendChild(link);
       link.click();
       link.remove();
-      setMessage('Downloading through this computer. Progress is in the browser’s download list. Cancel it there to stop the transfer.');
+      setMessage('The download was sent to your browser’s download list. Cancel it there to stop. A folder is sent as a zip and is not kept here.');
     } catch (caught) {
-      setTransferMode('Idle');
-      setError(caught instanceof Error ? caught.message : 'That download is not available.');
+      setTransferMode('idle');
+      fail('download', caught);
     }
   }
 
   const mine = shares.filter((share) => share.mine && !share.revoked);
   const others = shares.filter((share) => !share.mine && !share.revoked);
+  const sharesReady = shares.filter((share) => share.available && !share.revoked).length;
+  const plain = connectionPlain({
+    checking: link === 'checking',
+    reachable: link === 'reachable',
+    signedOut: link === 'signed-out',
+  });
+  const directAvailable = typeof window !== 'undefined' && window.isSecureContext;
+  const folderChosen = Boolean(preview?.some((file) => file.relativePath.includes('/')));
+  const details = supportDetails({
+    build: __PORTAL_BUILD__,
+    origin: typeof window === 'undefined' ? '' : window.location.origin,
+    reachable: link === 'reachable',
+    signedOut: link === 'signed-out',
+    registered: Boolean(selfId),
+    lastCheck: polledAt ? new Date(polledAt).toLocaleString() : '',
+    browsers: people.map((person) => person.displayName),
+    sharesReady,
+    directAvailable,
+    transfer: transferLabel(transferMode),
+    lastProblem: connectionProblem || error,
+    lastStatus,
+  });
 
-  const sources = shares.filter((share) => share.available && !share.revoked).length;
+  function copyDetails() {
+    const node = detailsRef.current;
+    if (!node) return;
+    node.focus();
+    node.select();
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      copied = false;
+    }
+    setCopyNote(copied
+      ? 'Copied. Paste this into a message for support.'
+      : 'Copy did not work. Select the details and copy them yourself.');
+  }
+
   const status = (
-    <dl className="connection-status">
-      <div><dt>Build</dt><dd>{__PORTAL_BUILD__}</dd></div>
-      <div><dt>API</dt><dd>{apiState}</dd></div>
-      <div><dt>Signaling</dt><dd>{signalState}</dd></div>
-      <div><dt>Session</dt><dd>{selfId ? 'Registered' : 'Not registered'}</dd></div>
-      <div><dt>Last poll</dt><dd>{polledAt ? new Date(polledAt).toLocaleTimeString() : 'None'}</dd></div>
-      <div><dt>Peers</dt><dd>{people.length}{people.length > 0 ? `: ${people.map((person) => person.displayName).join(', ')}` : ''}</dd></div>
-      <div><dt>Sources</dt><dd>{sources} available</dd></div>
-      <div><dt>Transfer</dt><dd>{transferMode}{typeof window !== 'undefined' && window.isSecureContext ? '' : ' · direct needs HTTPS'}</dd></div>
-    </dl>
+    <div className="connection-plain">
+      <p><strong>{plain.title}</strong></p>
+      <p>{plain.detail}</p>
+      <p>{browsersHere(people.map((person) => person.displayName))}</p>
+      <button type="button" className="ghost" onClick={() => { setCopyNote(''); setHelpOpen(true); }}>Help</button>
+    </div>
   );
 
   return (
     <>
     {hidden ? <section className="panel" aria-label="Connection">{status}</section> : null}
     <section className="panel share-desk" hidden={hidden}>
-      <h2>Read-only shares</h2>
-      <p>
-        Share only the files you select. A folder is the selection at that moment, not a folder that is watched.
-        Empty folders may be left out, and files added later are not included. Keep this browser tab open.
-        Switching to Library does not stop a share. Reloading or closing the tab does, until you select the files again.
-        Nothing here can be edited or deleted on the other computer. A copy someone already received cannot be recalled.
-      </p>
+      <h2>Share files and folders</h2>
+      <p>Choose files or a folder for other people to download. They cannot change or delete those files, and the files are not added to the library.</p>
+      <p><strong>Keep this tab open.</strong> Reloading or closing it stops sharing until you choose the files again. Switching to Library does not.</p>
       {hidden ? null : status}
       <label className="share-name">
-        Your name on this network
-        <input value={nameOnNetwork} onChange={(event) => rememberName(event.target.value)} />
+        Your name
+        <input value={nameOnNetwork} aria-describedby="share-name-help" onChange={(event) => rememberName(event.target.value)} />
       </label>
+      <p id="share-name-help" className="meta">Other people see this name. It applies to this browser only.</p>
       <div className="share-actions">
         <label className="button">
-          Share files
+          Choose files
           <input type="file" multiple onChange={(event) => { void stage(event.target.files); event.target.value = ''; }} />
         </label>
         {folderOk ? (
           <label className="button">
-            Share folder
+            Choose folder
             <input
               type="file"
               multiple
@@ -333,7 +375,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
             />
           </label>
         ) : (
-          <p className="meta">This browser cannot select a folder. Share files chooses one or more files instead.</p>
+          <p className="meta">This browser cannot choose a whole folder. Use Choose files instead.</p>
         )}
       </div>
       {message ? <p className="banner ok" role="status">{message}</p> : null}
@@ -347,15 +389,15 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
 
       {preview ? (
         <div className="share-preview">
-          <h3>This is exactly what will be published</h3>
+          <h3>Check before sharing</h3>
           <label>
             Share name
             <input value={shareName} onChange={(event) => setShareName(event.target.value)} />
           </label>
           <fieldset>
-            <legend>People who may download</legend>
-            <p className="meta">Only the people you tick can download. Someone who opens the portal later is not included until you publish again.</p>
-            {people.length === 0 ? <p className="meta">Nobody else has this portal open right now.</p> : null}
+            <legend>People who can download</legend>
+            <p className="meta">Only the people you tick can download. These files stay in this browser and are not saved in the library. Someone who opens this page later is not included until you share again.</p>
+            {people.length === 0 ? <p className="meta">No other browser has this page open right now.</p> : null}
             {people.map((person) => (
               <label key={person.peerId} className="check">
                 <input
@@ -371,7 +413,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
               </label>
             ))}
           </fieldset>
-          <p className="meta">Empty folders are left out. These paths are inside the share. The page does not show where they sit on your computer.</p>
+          {folderChosen ? <p className="meta">This is the folder as it is right now. Empty folders are left out. Files you add later are not included. The list shows names inside the share, not where they sit on your computer.</p> : <p className="meta">The list shows names inside the share, not where they sit on your computer.</p>}
           <ul className="share-tree">
             {preview.map((file) => (
               <li key={file.clientToken}>
@@ -385,39 +427,39 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
               {rejected.map((item) => (
                 <li key={`${item.relativePath}:${item.reason}`}>
                   <span>{item.relativePath || 'A selected path'}</span>
-                  <span className="meta">{item.reason}</span>
+                  <span className="meta">{explainRejected(item.reason)}</span>
                 </li>
               ))}
             </ul>
           ) : null}
           <div className="share-actions">
-            <button type="button" disabled={Boolean(busy)} onClick={() => void confirmShare()}>Publish share</button>
+            <button type="button" disabled={Boolean(busy)} onClick={() => void confirmShare()}>Start sharing</button>
             <button type="button" className="ghost" onClick={() => { setPreview(null); setDrafts(null); }}>Cancel</button>
           </div>
         </div>
       ) : null}
 
-      <h3>Your published shares</h3>
-      {mine.length === 0 ? <p className="meta">Nothing is published from this tab.</p> : (
+      <h3>You are sharing</h3>
+      {mine.length === 0 ? <p className="meta">You are not sharing anything from this tab.</p> : (
         <ul className="share-tree">
           {mine.map((share) => (
             <li key={share.id}>
               <button type="button" className="ghost" onClick={() => { setOpenId(share.id); setDir(''); setQuery(''); }}>{share.name}</button>
-              <span className="meta">{share.fileCount} files · {formatBytes(share.sizeBytes)} · {share.available ? 'Open' : 'Unavailable'}</span>
-              <button type="button" className="ghost danger" onClick={() => void revoke(share)}>Revoke</button>
+              <span className="meta">{share.fileCount} files · {formatBytes(share.sizeBytes)} · {share.available ? 'Ready' : 'Choose the files again'}</span>
+              <button type="button" className="ghost danger" onClick={() => void revoke(share)}>Stop sharing</button>
             </li>
           ))}
         </ul>
       )}
 
-      <h3>People here</h3>
-      <p className="meta">{people.length === 0 ? 'No other browser is connected yet.' : `Connected: ${people.map((person) => person.displayName).join(', ')}.`}</p>
-      {others.length === 0 ? <p className="meta">No one else is publishing a share you can open.</p> : (
+      <h3>Who is here</h3>
+      <p className="meta">{browsersHere(people.map((person) => person.displayName))}</p>
+      {others.length === 0 ? <p className="meta">Nobody else is sharing files you can open.</p> : (
         <ul className="share-tree">
           {others.map((share) => (
             <li key={share.id}>
               <button type="button" className="ghost" onClick={() => { setOpenId(share.id); setDir(''); setQuery(''); }}>{share.ownerName}: {share.name}</button>
-              <span className={share.available ? 'meta' : 'unavailable'}>{share.available ? `${share.fileCount} files` : 'Unavailable. Their tab is closed.'}</span>
+              <span className={share.available ? 'meta' : 'unavailable'}>{share.available ? `${share.fileCount} files` : 'Not available. Ask them to open the files again.'}</span>
             </li>
           ))}
         </ul>
@@ -426,7 +468,7 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
       {listing ? (
         <div>
           <h3>{listing.share.name}</h3>
-          {!listing.share.available ? <p className="unavailable">This share is unavailable until the sender selects the files again in an open tab.</p> : null}
+          {!listing.share.available ? <p className="unavailable">These files are not available until the sender chooses them again in an open tab.</p> : null}
           <nav className="crumbs" aria-label="Folder">
             <button type="button" className="ghost" onClick={() => setDir('')}>Top</button>
             {listing.breadcrumbs.map((crumb) => (
@@ -435,15 +477,15 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
           </nav>
           <label>
             Search this share
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="File or folder name" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search file names" />
           </label>
           {listing.share.available ? (
             <div className="share-actions">
               {listing.search ? null : (
-                <a className="button" href={relayZipUrl(listing.share.id, dir)} onClick={(event) => void startRelay(event)}>Download this folder through this computer</a>
+                <a className="button" href={relayZipUrl(listing.share.id, dir)} onClick={(event) => void startRelay(event)}>Download this folder</a>
               )}
-              {picked.length > 0 ? <a className="button" href={relayZipUrl(listing.share.id, '', picked)} onClick={(event) => void startRelay(event)}>Download selected through this computer</a> : null}
-              <p className="meta">Download through this computer uses the browser’s download list. That list shows progress, and canceling it stops the transfer. A folder is packed as a zip as it is sent. The portal does not keep the zip.</p>
+              {picked.length > 0 ? <a className="button" href={relayZipUrl(listing.share.id, '', picked)} onClick={(event) => void startRelay(event)}>Download selected</a> : null}
+              <p className="meta">Progress appears in your browser’s download list. Cancel it there to stop. A folder is sent as a zip and is not kept on this computer.</p>
             </div>
           ) : null}
           <ul className="share-tree">
@@ -465,10 +507,10 @@ export function ShareDesk({ csrf, hidden }: { csrf: string; hidden: boolean }) {
                 </label>
                 <span className="meta">{formatBytes(file.size)}</span>
                 {listing.share.available && !listing.share.mine && directShareAvailable(file.size) ? (
-                  <button type="button" onClick={() => void takeDirect(listing.share, file)}>Direct download</button>
+                  <button type="button" onClick={() => void takeDirect(listing.share, file)}>From their browser</button>
                 ) : null}
                 {listing.share.available ? (
-                  <a href={relayFileUrl(listing.share.id, file.id)} onClick={(event) => void startRelay(event)}>Download through this computer</a>
+                  <a href={relayFileUrl(listing.share.id, file.id)} onClick={(event) => void startRelay(event)}>Download</a>
                 ) : null}
               </li>
             ))}
