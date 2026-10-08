@@ -44,6 +44,7 @@ import {
   splitFolderPath,
 } from './folders.js';
 import { uniqueZipName, writeStoredZip } from './zip.js';
+import { createTransferTracker, readProgressId, safeTransferName, writeChunks, type TransferTracker } from './transferTrack.js';
 import {
   addToCollection,
   attachTag,
@@ -120,6 +121,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   const slots = new UploadSlots(config.maxUploadsPerUser, config.maxUploadsGlobal);
   const peers = createPeerHub();
   const shareHub = createShareHub(config.maxFileBytes);
+  const transfers = createTransferTracker();
   const limits = publicLimits(config);
 
   const app = express();
@@ -245,7 +247,24 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
     }
   });
 
-  registerShareRoutes(app, shareHub, requireAuth, requireCsrf, ensurePeerId);
+  registerShareRoutes(app, shareHub, requireAuth, requireCsrf, ensurePeerId, transfers);
+
+  app.get('/api/transfers/:id', requireAuth, (req, res) => {
+    const viewed = transfers.view(req.session.userId!, routeId(req));
+    if (!viewed) {
+      res.status(404).json({ error: 'That transfer is not available.' });
+      return;
+    }
+    res.json(viewed);
+  });
+
+  app.delete('/api/transfers/:id', requireAuth, requireCsrf, (req, res) => {
+    if (!transfers.cancel(req.session.userId!, routeId(req))) {
+      res.status(404).json({ error: 'That transfer is not available.' });
+      return;
+    }
+    res.json({ ok: true });
+  });
 
   app.get('/api/peers', requireAuth, async (req, res, next) => {
     try {
@@ -600,7 +619,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   });
 
   app.get('/api/files/zip', requireAuth, (req, res, next) => {
-    void handleZip(req, res, db, config).catch(next);
+    void handleZip(req, res, db, config, transfers).catch(next);
   });
 
   app.get('/api/files/:id/preview', requireAuth, (req, res, next) => {
@@ -612,7 +631,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   });
 
   app.get('/api/files/:id/download', requireAuth, (req, res, next) => {
-    void handleDownload(req, res, db, config).catch(next);
+    void handleDownload(req, res, db, config, transfers).catch(next);
   });
 
   app.post('/api/files/:id/replace', requireAuth, requireCsrf, (req, res, next) => {
@@ -636,7 +655,7 @@ export async function createApp(config: AppConfig, options: AppOptions = {}): Pr
   });
 
   app.get('/api/files/:id/versions/:versionId/download', requireAuth, (req, res, next) => {
-    void handleVersionDownload(req, res, db, config).catch(next);
+    void handleVersionDownload(req, res, db, config, transfers).catch(next);
   });
 
   app.delete('/api/files/:id/versions/:versionId', requireAuth, requireCsrf, (req, res, next) => {
@@ -1380,7 +1399,7 @@ function sendReplacementFailure(res: Response, reason: 'missing' | 'forbidden' |
   res.status(404).json({ error: 'That file is not in the portal.' });
 }
 
-async function handleVersionDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+async function handleVersionDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig, transfers: TransferTracker): Promise<void> {
   const record = getReadyFile(db, routeId(req), req.session.userId!);
   const versionId = typeof req.params.versionId === 'string' ? req.params.versionId : '';
   const version = record ? listFileVersions(db, record.id).find((item) => item.id === versionId) : undefined;
@@ -1394,17 +1413,12 @@ async function handleVersionDownload(req: Request, res: Response, db: DatabaseSy
     res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
     return;
   }
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', String(size));
-  res.setHeader('Content-Disposition', attachmentDisposition(version.originalName));
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Cache-Control', 'private, no-store');
-  const stream = createReadStream(finalPath);
-  stream.on('error', () => {
-    if (!res.headersSent) res.status(500).end();
-    else res.destroy();
+  await sendKnownDownload(req, res, transfers, {
+    filePath: finalPath,
+    size,
+    filename: version.originalName,
+    kind: 'library',
   });
-  await pipeline(stream, res).catch(() => undefined);
 }
 
 async function handleVersionDelete(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
@@ -1667,7 +1681,7 @@ async function sendInlineFile(req: Request, res: Response, filePath: string, siz
   await pipeline(stream, res).catch(() => undefined);
 }
 
-async function handleDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
+async function handleDownload(req: Request, res: Response, db: DatabaseSync, config: AppConfig, transfers: TransferTracker): Promise<void> {
   const id = req.params.id;
   const record = getReadyFile(db, id, req.session.userId!);
   if (!record) {
@@ -1681,28 +1695,93 @@ async function handleDownload(req: Request, res: Response, db: DatabaseSync, con
     return;
   }
 
+  await sendKnownDownload(req, res, transfers, {
+    filePath: finalPath,
+    size,
+    filename: record.originalName,
+    kind: 'library',
+  });
+}
+
+async function sendKnownDownload(
+  req: Request,
+  res: Response,
+  transfers: TransferTracker,
+  input: { filePath: string; size: number; filename: string; kind: 'library' },
+): Promise<void> {
+  const progressId = attachDownload(req, res, transfers, {
+    filename: input.filename,
+    kind: input.kind,
+    totalBytes: input.size,
+    sourceTotal: input.size,
+  });
   res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', String(size));
-  res.setHeader('Content-Disposition', attachmentDisposition(record.originalName));
+  res.setHeader('Content-Length', String(input.size));
+  res.setHeader('Content-Disposition', attachmentDisposition(input.filename));
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, no-store');
   if (req.method === 'HEAD') {
+    transfers.finish(progressId);
     res.end();
     return;
   }
-
-  const stream = createReadStream(finalPath);
+  let settled = false;
+  req.on('close', () => {
+    if (!res.writableEnded && !settled) transfers.fail(progressId, 'closed');
+  });
+  const stream = createReadStream(input.filePath);
   stream.on('error', (error) => {
     console.error(`storage read failed (${'code' in error ? String(error.code) : 'unknown'})`);
+    if (!settled) transfers.fail(progressId, 'failed');
     if (!res.headersSent) {
       res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
     } else {
       res.destroy();
     }
   });
-  await pipeline(stream, res).catch(() => {
-    // The client may have cancelled the download. The stored file stays in place.
+  try {
+    const seen = await writeChunks(res, stream, (bytes) => transfers.add(progressId, 'sentBytes', bytes));
+    if (seen !== input.size) {
+      transfers.fail(progressId, 'failed');
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+      } else {
+        res.destroy();
+      }
+      return;
+    }
+    res.end();
+    settled = true;
+    transfers.finish(progressId);
+  } catch {
+    if (!settled) transfers.fail(progressId, 'closed');
+    if (!res.headersSent && !res.destroyed) {
+      res.status(500).json({ error: 'This file is unavailable. Ask the person who uploaded it to upload it again.' });
+    }
+  }
+}
+
+function attachDownload(
+  req: Request,
+  res: Response,
+  transfers: TransferTracker,
+  input: { filename: string; kind: 'library' | 'library-zip'; totalBytes: number | null; sourceTotal: number | null },
+): string | null {
+  const id = readProgressId(req.query.progress);
+  const userId = req.session.userId;
+  if (!id || !userId) return null;
+  const opened = transfers.open({
+    id,
+    userId,
+    filename: safeTransferName(input.filename),
+    kind: input.kind,
+    totalBytes: input.totalBytes,
+    sourceTotal: input.sourceTotal,
+    abort: () => {
+      if (!res.writableEnded) res.destroy();
+    },
   });
+  return opened ? id : null;
 }
 
 async function handleBin(req: Request, res: Response, db: DatabaseSync, config: AppConfig): Promise<void> {
